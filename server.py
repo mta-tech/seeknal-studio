@@ -71,6 +71,11 @@ DRAFT_DEPS_LIMIT = 1_000
 DRAFT_OPTIONS_LOCK = threading.Lock()
 DRAFT_OPTIONS_CACHE: dict | None = None
 WORK_ACCEPTANCE_LOCK = threading.RLock()
+# One lint at a time; a request that cannot start within DIAGNOSTICS_WAIT
+# seconds reports "unavailable" instead of queueing behind others.
+DIAGNOSTICS_LOCK = threading.Lock()
+DIAGNOSTICS_WAIT = 1.0
+DIAGNOSTICS_TIMEOUT = 5
 
 
 class EditorConflictError(RuntimeError):
@@ -555,6 +560,58 @@ def extract_editor_sql(relative: object, content: object) -> dict:
     if not isinstance(value, dict) or not isinstance(value.get("sql"), str):
         raise ValueError("transform SQL could not be extracted")
     return value
+
+
+def editor_diagnostics(data: dict) -> dict:
+    """Advisory lint of an editor buffer. Lint problems never fail the request:
+    they are reported as an ``unavailable`` reason with no diagnostics."""
+    relative = data.get("path")
+    content = data.get("content")
+    version = data.get("version")
+    target = safe_file(relative)
+    if target is None or not isinstance(content, str) or target.suffix not in {".yml", ".yaml", ".py"}:
+        raise ValueError("a Seeknal project file is required")
+    if not isinstance(version, int) or isinstance(version, bool):
+        raise ValueError("version must be an integer")
+    if len(content.encode("utf-8")) > MAX_BODY:
+        raise ValueError("editor content exceeds 300 KB")
+    started = time.monotonic()
+    response = {
+        "path": relative, "version": version,
+        "content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+        "index_rev": None, "diagnostics": [], "skipped": [],
+    }
+    if not DIAGNOSTICS_LOCK.acquire(timeout=DIAGNOSTICS_WAIT):
+        return {**response, "unavailable": "another lint is still running", "elapsed_ms": 0}
+    try:
+        result = subprocess.run(
+            [str(PYTHON), str(BRIDGE), "diagnostics", str(PROJECT)],
+            cwd=PROJECT,
+            env=clean_environment(),
+            input=json.dumps({"path": relative, "content": content}),
+            capture_output=True,
+            text=True,
+            timeout=DIAGNOSTICS_TIMEOUT,
+            shell=False,
+        )
+        value = json.loads(result.stdout) if result.returncode == 0 else None
+        if isinstance(value, dict) and isinstance(value.get("diagnostics"), list):
+            response.update(
+                diagnostics=value["diagnostics"],
+                skipped=value.get("skipped") if isinstance(value.get("skipped"), list) else [],
+                index_rev=value.get("index_rev"),
+            )
+        else:
+            detail = (result.stderr or "").strip().splitlines()[-1:] or ["no output"]
+            response["unavailable"] = f"lint failed: {detail[0][:200]}"
+    except subprocess.TimeoutExpired:
+        response["unavailable"] = f"lint timed out after {DIAGNOSTICS_TIMEOUT} s"
+    except (OSError, ValueError) as error:
+        response["unavailable"] = f"lint failed: {str(error)[:200]}"
+    finally:
+        DIAGNOSTICS_LOCK.release()
+    response["elapsed_ms"] = round((time.monotonic() - started) * 1000)
+    return response
 
 
 class JobStore:
@@ -1601,6 +1658,8 @@ class Handler(SimpleHTTPRequestHandler):
                         with REPL_QUERY_LOCK:
                             REPL_QUERY_IDS.add(query["query_id"])
                     self.send_json(query, 202)
+            elif self.path == "/api/diagnostics":
+                self.send_json(editor_diagnostics(data))
             elif self.path == "/api/repl/extract":
                 self.send_json(extract_editor_sql(data.get("path"), data.get("content")))
             elif self.path == "/api/repl/reload":

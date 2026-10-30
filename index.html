@@ -149,6 +149,11 @@
               <pre id="line-numbers" aria-hidden="true">1</pre>
               <pre id="syntax-layer" class="syntax-layer" aria-hidden="true"></pre>
               <textarea id="code-editor" aria-label="Pipeline code editor" spellcheck="false" disabled placeholder="Select a file from the explorer or graph."></textarea>
+              <div id="diagnostic-tooltip" class="diagnostic-tooltip" role="tooltip" hidden></div>
+            </div>
+            <div id="editor-problems" class="editor-problems" hidden>
+              <div class="editor-problems-head"><span>Problems</span><b id="editor-problem-summary"></b></div>
+              <ul id="editor-problem-list" class="editor-problem-list" aria-label="Problems in this file"></ul>
             </div>
             <div id="editor-flow" class="editor-flow" hidden>
               <div class="editor-flow-copy"><span id="editor-flow-label">Saved</span><small id="editor-flow-detail">Active pipeline file</small></div>
@@ -248,6 +253,7 @@
       <span><svg viewBox="0 0 24 24"><path d="M12 4c-4 0-4 3-4 5h7v2H7c-3 0-4 2-4 4s2 4 5 4h2v-3H8v-2h5c4 0 4-3 4-5s-1-5-5-5Z"/><circle cx="11" cy="6.5" r=".8"/><path d="M12 20c4 0 4-3 4-5H9v-2h8c3 0 4-2 4-4s-2-4-5-4h-2v3h2v2h-5c-4 0-4 3-4 5s1 5 5 5Z"/><circle cx="13" cy="17.5" r=".8"/></svg>Python</span>
       <span><svg viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="7" ry="3"/><path d="M5 5v7c0 1.7 3.1 3 7 3s7-1.3 7-3V5M5 12v7c0 1.7 3.1 3 7 3s7-1.3 7-3v-7"/></svg>DuckDB</span>
       <span><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="14" rx="2"/><path d="M9 22h6M12 18v4"/></svg><b id="footer-location">Local project</b></span>
+      <span id="diagnostic-status" class="diagnostic-status" aria-live="polite" hidden></span>
       <div class="status-spacer"></div>
       <span id="status-message" role="status">Starting Seeknal Studio…</span>
     </footer>

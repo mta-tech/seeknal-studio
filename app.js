@@ -138,6 +138,125 @@ function captureDraftContext(editorGroups, selectedFile) {
   return { groupId: editorGroups.activeGroup, selectedFile };
 }
 
+// Editor diagnostics. Ranges are LSP-style 0-based {line, character}; severity 1 error, 2 warning, 3 info.
+function diagnosticsResponseCurrent(response, current) {
+  return Boolean(response && current && response.path === current.path && response.version === current.version);
+}
+
+// Next diagnostics state for a lint response, or null when the response is stale. An
+// "unavailable" response keeps the previous diagnostics of the same file (the editor clamps
+// them to the current text), records the reason, and marks them stale when they were
+// computed for different content.
+function nextDiagnosticsState(previous, response, current) {
+  if (!diagnosticsResponseCurrent(response, current)) return null;
+  if (response.unavailable) {
+    const items = previous.path === current.path ? previous.items : [];
+    const stale = items.length > 0 && (!response.content_sha256 || response.content_sha256 !== previous.contentHash);
+    return { path: current.path, items, contentHash: previous.contentHash || null, stale, unavailable: String(response.unavailable) };
+  }
+  return { path: current.path, items: Array.isArray(response.diagnostics) ? response.diagnostics : [], contentHash: response.content_sha256 || null, stale: false, unavailable: null };
+}
+
+function severityName(severity) { return severity === 1 ? "error" : severity === 2 ? "warning" : "info"; }
+
+function comparePositions(a, b) { return a.line - b.line || a.character - b.character; }
+
+// Per-line underline segments [{line, start, end, severity}], clamped to the text. A range
+// that is empty on its first line covers one character; overlaps keep the most severe level.
+function diagnosticDecorations(content, diagnostics) {
+  const lines = String(content).split("\n");
+  const byLine = new Map();
+  for (const item of diagnostics || []) {
+    const { start, end } = item.range || {};
+    if (!start || !end || start.line < 0 || start.line >= lines.length) continue;
+    for (let line = start.line; line <= Math.min(end.line, lines.length - 1); line += 1) {
+      const length = lines[line].length;
+      let from = line === start.line ? Math.min(start.character, length) : 0;
+      let to = line === end.line ? Math.min(end.character, length) : length;
+      if (to <= from && line === start.line) [from, to] = from < length ? [from, from + 1] : [Math.max(0, length - 1), length];
+      if (to <= from) continue;
+      if (!byLine.has(line)) byLine.set(line, []);
+      byLine.get(line).push({ from, to, severity: item.severity || 1 });
+    }
+  }
+  const segments = [];
+  for (const line of [...byLine.keys()].sort((a, b) => a - b)) {
+    const ranges = byLine.get(line);
+    const points = [...new Set(ranges.flatMap(range => [range.from, range.to]))].sort((a, b) => a - b);
+    for (let index = 0; index < points.length - 1; index += 1) {
+      const covering = ranges.filter(range => range.from <= points[index] && range.to >= points[index + 1]);
+      if (!covering.length) continue;
+      const severity = Math.min(...covering.map(range => range.severity));
+      const previous = segments.at(-1);
+      if (previous?.line === line && previous.end === points[index] && previous.severity === severity) previous.end = points[index + 1];
+      else segments.push({ line, start: points[index], end: points[index + 1], severity });
+    }
+  }
+  return segments;
+}
+
+// Cuts a line's syntax pieces ([text, className]) at segment boundaries; `segment` is the
+// index of the covering segment or -1.
+function splitDecoratedPieces(pieces, segments) {
+  const cuts = segments.flatMap(segment => [segment.start, segment.end]);
+  const fragments = [];
+  let offset = 0;
+  for (const [text, className] of pieces) {
+    const end = offset + text.length;
+    const points = [offset, ...cuts.filter(cut => cut > offset && cut < end), end];
+    for (let index = 0; index < points.length - 1; index += 1) {
+      const [from, to] = [points[index], points[index + 1]];
+      if (to <= from) continue;
+      const segment = segments.findIndex(item => item.start <= from && to <= item.end);
+      fragments.push({ text: text.slice(from - offset, to - offset), className, segment });
+    }
+    offset = end;
+  }
+  return fragments;
+}
+
+function diagnosticLineSeverities(diagnostics, lineCount) {
+  const severities = new Map();
+  for (const item of diagnostics || []) {
+    const { start, end } = item.range || {};
+    if (!start || !end) continue;
+    for (let line = Math.max(0, start.line); line <= Math.min(end.line, lineCount - 1); line += 1) {
+      severities.set(line, Math.min(severities.get(line) || 3, item.severity || 1));
+    }
+  }
+  return severities;
+}
+
+// The most severe diagnostic whose range contains the position (end inclusive, so a caret
+// right after a marked word still finds it).
+function diagnosticAt(diagnostics, position) {
+  if (!position || position.line < 0 || position.character < 0) return null;
+  const matches = (diagnostics || []).filter(item => item.range
+    && comparePositions(item.range.start, position) <= 0 && comparePositions(position, item.range.end) <= 0);
+  return matches.sort((a, b) => (a.severity || 1) - (b.severity || 1))[0] || null;
+}
+
+function offsetToPosition(content, offset) {
+  const before = String(content).slice(0, offset).split("\n");
+  return { line: before.length - 1, character: before.at(-1).length };
+}
+
+function positionToOffset(content, position) {
+  const lines = String(content).split("\n");
+  const line = Math.min(Math.max(position.line, 0), lines.length - 1);
+  return lines.slice(0, line).reduce((total, text) => total + text.length + 1, 0) + Math.min(Math.max(position.character, 0), lines[line].length);
+}
+
+// Text position under a pointer; metrics give the text origin (already scrolled) and cell size.
+function pointerPosition(point, metrics) {
+  return { line: Math.floor((point.y - metrics.top) / metrics.lineHeight), character: Math.floor((point.x - metrics.left) / metrics.charWidth) };
+}
+
+function diagnosticSummary(diagnostics) {
+  const counts = [1, 2, 3].map(severity => (diagnostics || []).filter(item => (item.severity || 1) === severity).length);
+  return counts.map((count, index) => count ? `${count} ${["error", "warning", "info"][index]}${count === 1 || index === 2 ? "" : "s"}` : "").filter(Boolean).join(" · ");
+}
+
 const state = {
   project: null,
   files: [],
@@ -176,6 +295,7 @@ const state = {
   editorFlow: createEditorFlowState(),
   editorPrepareGeneration: { value: 0 },
   editorValidation: null,
+  diagnostics: { path: null, version: 0, items: [], unavailable: null, contentHash: null, controller: null, timer: null, supported: true },
 };
 
 const icons = {
@@ -694,6 +814,7 @@ async function openFile(path, { guard = true } = {}) {
     $("#save-status").textContent = state.editorFlow.kind === "draft" ? "Draft · not applied" : state.editorFlow.kind === "active" ? "Saved · Active" : "Saved";
     updateEditorActions();
     updateLineNumbers();
+    scheduleDiagnostics(0);
     syncFileSelection();
     renderGraph();
     const linked = state.graph.nodes.find(node => nodePath(node) === state.selectedFile || node.name === fileName(path).replace(/\.ya?ml$/, ""));
@@ -724,9 +845,29 @@ async function selectNode(id, { guard = true } = {}) {
 function updateLineNumbers() {
   const editor = $("#code-editor");
   const count = Math.max(1, editor.value.split("\n").length);
-  $("#line-numbers").textContent = Array.from({ length: count }, (_, index) => index + 1).join("\n");
+  renderGutter(count);
   $("#line-numbers").scrollTop = editor.scrollTop;
   renderSyntax(editor.value);
+}
+
+function renderGutter(count) {
+  const gutter = $("#line-numbers");
+  const severities = diagnosticLineSeverities(currentDiagnostics(), count);
+  if (!severities.size) { gutter.textContent = Array.from({ length: count }, (_, index) => index + 1).join("\n"); return; }
+  const nodes = [];
+  let text = "";
+  for (let index = 0; index < count; index += 1) {
+    const separator = index < count - 1 ? "\n" : "";
+    if (!severities.has(index)) { text += `${index + 1}${separator}`; continue; }
+    if (text) nodes.push(document.createTextNode(text));
+    const number = document.createElement("span");
+    number.className = `gutter-diag diag-${severityName(severities.get(index))}`;
+    number.textContent = String(index + 1);
+    nodes.push(number);
+    text = separator;
+  }
+  if (text) nodes.push(document.createTextNode(text));
+  gutter.replaceChildren(...nodes);
 }
 
 function renderSyntax(content) {
@@ -734,22 +875,168 @@ function renderSyntax(content) {
   layer.replaceChildren();
   const tokenPattern = /(['"][^'"\n]*['"]|\b\d+(?:\.\d+)?\b|\b(?:SELECT|FROM|WHERE|GROUP|BY|AS|SUM|MAX|COUNT|CASE|WHEN|THEN|ELSE|END|AND|OR|JOIN|ON|WITH|ORDER|DESC|ASC|DISTINCT)\b|[A-Za-z_][\w-]*(?=\s*:))/gi;
   const sqlWords = /^(?:SELECT|FROM|WHERE|GROUP|BY|AS|SUM|MAX|COUNT|CASE|WHEN|THEN|ELSE|END|AND|OR|JOIN|ON|WITH|ORDER|DESC|ASC|DISTINCT)$/i;
-  for (const [lineIndex, line] of content.split("\n").entries()) {
+  const lines = content.split("\n");
+  const decorations = diagnosticDecorations(content, currentDiagnostics());
+  for (const [lineIndex, line] of lines.entries()) {
     const commentAt = line.indexOf("#");
     const code = commentAt >= 0 ? line.slice(0, commentAt) : line;
+    const pieces = [];
     let cursor = 0;
     for (const match of code.matchAll(tokenPattern)) {
-      if (match.index > cursor) layer.append(document.createTextNode(code.slice(cursor, match.index)));
-      const token = document.createElement("span");
-      token.textContent = match[0];
-      token.className = /^['"]/.test(match[0]) ? "syntax-string" : /^\d/.test(match[0]) ? "syntax-number" : sqlWords.test(match[0]) ? "syntax-keyword" : "syntax-key";
-      layer.append(token); cursor = match.index + match[0].length;
+      if (match.index > cursor) pieces.push([code.slice(cursor, match.index), ""]);
+      pieces.push([match[0], /^['"]/.test(match[0]) ? "syntax-string" : /^\d/.test(match[0]) ? "syntax-number" : sqlWords.test(match[0]) ? "syntax-keyword" : "syntax-key"]);
+      cursor = match.index + match[0].length;
     }
-    layer.append(document.createTextNode(code.slice(cursor)));
-    if (commentAt >= 0) { const comment = document.createElement("span"); comment.className = "syntax-comment"; comment.textContent = line.slice(commentAt); layer.append(comment); }
-    if (lineIndex < content.split("\n").length - 1) layer.append(document.createTextNode("\n"));
+    pieces.push([code.slice(cursor), ""]);
+    if (commentAt >= 0) pieces.push([line.slice(commentAt), "syntax-comment"]);
+    appendDecoratedLine(layer, pieces, decorations.filter(segment => segment.line === lineIndex));
+    if (lineIndex < lines.length - 1) layer.append(document.createTextNode("\n"));
   }
   const editor = $("#code-editor"); layer.scrollTop = editor.scrollTop; layer.scrollLeft = editor.scrollLeft;
+}
+
+function appendDecoratedLine(layer, pieces, segments) {
+  let wrapper = null, wrapperSegment = -1;
+  for (const { text, className, segment } of splitDecoratedPieces(pieces, segments)) {
+    const node = className ? Object.assign(document.createElement("span"), { className, textContent: text }) : document.createTextNode(text);
+    if (segment < 0) { wrapper = null; layer.append(node); continue; }
+    if (!wrapper || wrapperSegment !== segment) {
+      wrapper = document.createElement("span");
+      wrapper.className = `diag diag-${severityName(segments[segment].severity)}`;
+      wrapperSegment = segment;
+      layer.append(wrapper);
+    }
+    wrapper.append(node);
+  }
+}
+
+function currentDiagnostics() {
+  return state.diagnostics.path === state.selectedFile ? state.diagnostics.items : [];
+}
+
+function diagnosticsEligible(path = "") {
+  return isPipelinePath(path) || (/\.py$/i.test(path) && (path.startsWith("seeknal/") || isDraftPath(path)));
+}
+
+// Every buffer change bumps the version, cancels the in-flight lint and schedules a new one.
+function scheduleDiagnostics(delay = 350) {
+  const lint = state.diagnostics;
+  lint.version += 1;
+  lint.controller?.abort();
+  clearTimeout(lint.timer);
+  lint.timer = setTimeout(requestDiagnostics, delay);
+  if (lint.path !== state.selectedFile) { renderEditorProblems(); updateDiagnosticStatus(); }
+}
+
+async function requestDiagnostics() {
+  const lint = state.diagnostics;
+  const path = state.selectedFile;
+  if (!lint.supported || !path || !diagnosticsEligible(path)) { setDiagnostics({ path, items: [], unavailable: null }); return; }
+  const version = lint.version;
+  const controller = new AbortController();
+  lint.controller = controller;
+  let response;
+  try {
+    response = await api("/api/diagnostics", { method: "POST", body: { path, content: $("#code-editor").value, version }, signal: controller.signal });
+  } catch (error) {
+    // Diagnostics are advisory. A server without the route (older remote Studio) turns them
+    // off until the workspace reloads; any other failure is shown like "unavailable".
+    if (error.name === "AbortError") return;
+    if (error.status === 404) { lint.supported = false; setDiagnostics({ path, items: [], unavailable: null }); return; }
+    response = { path, version, unavailable: error.message || "request failed" };
+  } finally {
+    if (lint.controller === controller) lint.controller = null;
+  }
+  const next = nextDiagnosticsState(lint, response, { path: state.selectedFile, version: lint.version });
+  if (next) setDiagnostics(next);
+}
+
+function setDiagnostics({ path, items, unavailable, contentHash = null, stale = false }) {
+  state.diagnostics.path = path;
+  state.diagnostics.unavailable = unavailable;
+  state.diagnostics.contentHash = contentHash;
+  // Kept diagnostics for older content stay visible but dimmed until a good reply.
+  for (const element of [$(".editor-wrap"), $("#editor-problems")]) element.classList.toggle("diag-stale", stale);
+  state.diagnostics.items = [...items].sort((a, b) => comparePositions(a.range.start, b.range.start) || (a.severity || 1) - (b.severity || 1));
+  updateLineNumbers();
+  renderEditorProblems();
+  updateDiagnosticStatus();
+}
+
+function renderEditorProblems() {
+  const items = currentDiagnostics();
+  const unavailable = state.diagnostics.path === state.selectedFile ? state.diagnostics.unavailable : null;
+  $("#editor-problems").hidden = !items.length && !unavailable;
+  $("#editor-problem-summary").textContent = [diagnosticSummary(items), unavailable && `Diagnostics unavailable: ${unavailable}`].filter(Boolean).join(" · ");
+  $("#editor-problem-list").replaceChildren(...items.map(item => {
+    const row = document.createElement("li");
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = `editor-problem diag-${severityName(item.severity)}`;
+    const marker = document.createElement("i");
+    const message = document.createElement("span");
+    message.textContent = item.message;
+    const location = document.createElement("small");
+    location.textContent = `Ln ${item.range.start.line + 1}, Col ${item.range.start.character + 1}`;
+    button.append(marker, message, location);
+    button.addEventListener("click", () => revealDiagnostic(item));
+    row.append(button);
+    return row;
+  }));
+}
+
+function revealDiagnostic(item) {
+  const editor = $("#code-editor");
+  const offset = positionToOffset(editor.value, item.range.start);
+  editor.focus({ preventScroll: true });
+  editor.setSelectionRange(offset, offset);
+  const lineHeight = parseFloat(getComputedStyle(editor).lineHeight) || 21;
+  editor.scrollTop = Math.max(0, item.range.start.line * lineHeight - editor.clientHeight / 3);
+  updateDiagnosticStatus();
+}
+
+function updateDiagnosticStatus() {
+  const editor = $("#code-editor");
+  const status = $("#diagnostic-status");
+  const item = diagnosticAt(currentDiagnostics(), offsetToPosition(editor.value, editor.selectionStart));
+  const text = item ? `${capitalize(severityName(item.severity))}: ${item.message}` : "";
+  // Only touch the polite live region when the message changes, so caret moves stay quiet.
+  if (status.textContent === text) return;
+  status.hidden = !item;
+  status.className = item ? `diagnostic-status diag-${severityName(item.severity)}` : "diagnostic-status";
+  status.textContent = text;
+}
+
+function editorMetrics(editor) {
+  const style = getComputedStyle(editor);
+  const rect = editor.getBoundingClientRect();
+  const font = `${style.fontSize} ${style.fontFamily}`;
+  if (editorMetrics.font !== font) {
+    const context = document.createElement("canvas").getContext("2d");
+    context.font = font;
+    editorMetrics.font = font;
+    editorMetrics.charWidth = context.measureText("0").width || 7.8;
+  }
+  return {
+    left: rect.left + editor.clientLeft + parseFloat(style.paddingLeft) - editor.scrollLeft,
+    top: rect.top + editor.clientTop + parseFloat(style.paddingTop) - editor.scrollTop,
+    lineHeight: parseFloat(style.lineHeight) || 21,
+    charWidth: editorMetrics.charWidth,
+  };
+}
+
+function showDiagnosticTooltip(event) {
+  const tooltip = $("#diagnostic-tooltip");
+  const items = currentDiagnostics();
+  const editor = event.currentTarget;
+  const item = items.length ? diagnosticAt(items, pointerPosition({ x: event.clientX, y: event.clientY }, editorMetrics(editor))) : null;
+  if (!item) { tooltip.hidden = true; return; }
+  const wrap = editor.parentElement.getBoundingClientRect();
+  tooltip.textContent = item.message;
+  tooltip.className = `diagnostic-tooltip diag-${severityName(item.severity)}`;
+  tooltip.style.left = `${Math.min(event.clientX - wrap.left + 12, Math.max(0, wrap.width - 380))}px`;
+  tooltip.style.top = `${event.clientY - wrap.top + 18}px`;
+  tooltip.hidden = false;
 }
 
 function markDirty() {
@@ -806,6 +1093,7 @@ async function refreshGraph() {
     $("#graph-state").textContent = "syncing";
     state.graph = normalizeGraph(await api("/api/graph"));
     renderGraph();
+    if (state.selectedFile) scheduleDiagnostics(0);
     setStatus("Pipeline graph refreshed", "success");
   } catch (error) { showError(error); }
 }
@@ -818,6 +1106,9 @@ async function refreshWorkspaceState() {
   renderProject(); renderFiles(); renderGraph();
   await loadDrafts();
   updateEditorActions();
+  // Project and workspace switches reload the page; this also retries after an older backend.
+  state.diagnostics.supported = true;
+  if (state.selectedFile) scheduleDiagnostics(0);
 }
 
 async function startJob(action, node = null, extra = {}, local = {}) {
@@ -893,7 +1184,7 @@ async function pollJob(id) {
           state.currentDiff = null;
           $("#editor-title").textContent = fileName(state.selectedFile);
           $("#save-status").textContent = "Unsaved";
-          syncFileSelection(); updateLineNumbers(); updateEditorActions(); renderGraph();
+          syncFileSelection(); updateLineNumbers(); updateEditorActions(); renderGraph(); scheduleDiagnostics(0);
           setMainView("yaml", applied.groupId);
           setStatus("Changes applied on disk; newer editor edits were preserved", "success");
         } else if (applied) setStatus(`Changes applied to ${applied.destination}; current editor selection was preserved`, "success");
@@ -2778,7 +3069,10 @@ function openRunHistory() {
 }
 
 function bindEvents() {
-  $("#code-editor").addEventListener("input", () => { updateLineNumbers(); markDirty(); });
+  $("#code-editor").addEventListener("input", () => { updateLineNumbers(); markDirty(); scheduleDiagnostics(); updateDiagnosticStatus(); });
+  for (const type of ["click", "keyup", "select", "focus"]) $("#code-editor").addEventListener(type, updateDiagnosticStatus);
+  $("#code-editor").addEventListener("mousemove", showDiagnosticTooltip);
+  $("#code-editor").addEventListener("mouseleave", () => { $("#diagnostic-tooltip").hidden = true; });
   $("#code-editor").addEventListener("scroll", event => { $("#line-numbers").scrollTop = event.currentTarget.scrollTop; $("#syntax-layer").scrollTop = event.currentTarget.scrollTop; $("#syntax-layer").scrollLeft = event.currentTarget.scrollLeft; });
   $("#code-editor").addEventListener("keydown", event => {
     if (event.key === "Tab") {
@@ -2947,7 +3241,7 @@ function bindEvents() {
 }
 
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { createEditorGroupState, editorOpen, editorClose, editorSplit, editorMove, editorMoveActive, editorMerge, createEditorFlowState, editorFlowAction, editorFlowTransition, nextRequestGeneration, matchesValidationContext, matchesApplyContext, rebaseEditorAfterApply, rebaseDirtyDraftAfterPrepare, captureDraftContext };
+  module.exports = { createEditorGroupState, editorOpen, editorClose, editorSplit, editorMove, editorMoveActive, editorMerge, createEditorFlowState, editorFlowAction, editorFlowTransition, nextRequestGeneration, matchesValidationContext, matchesApplyContext, rebaseEditorAfterApply, rebaseDirtyDraftAfterPrepare, captureDraftContext, diagnosticsResponseCurrent, nextDiagnosticsState, diagnosticDecorations, splitDecoratedPieces, diagnosticLineSeverities, diagnosticAt, offsetToPosition, positionToOffset, pointerPosition, diagnosticSummary };
 }
 
 if (typeof window !== "undefined" && typeof document !== "undefined") {
@@ -2976,6 +3270,8 @@ if (typeof window !== "undefined" && typeof document !== "undefined") {
     openDraftReview,
     validateCurrentDraft,
     applyCurrentDraft,
+    requestDiagnostics,
+    diagnostics: () => ({ path: state.diagnostics.path, version: state.diagnostics.version, items: currentDiagnostics() }),
     snapshot: () => ({ project: state.project?.project, files: state.files.length, nodes: state.graph.nodes.length, edges: state.graph.edges.length, selectedNode: state.selectedNode, selectedFile: state.selectedFile, dirty: state.dirty, agentConfigured: state.agent.configured, agentReady: state.agent.ready, agentProjectVerified: state.agent.project_verified, agentModel: state.agent.model, activeJob: state.activeJob, editorGroups: state.editorGroups }),
   };
   bindEvents();

@@ -350,6 +350,18 @@ def extract_sql(project: Path, relative: str, content: str) -> dict:
     }
 
 
+def diagnostics(project: Path, payload: str) -> dict:
+    """Lint editor content; parse-only, never imports Seeknal or project code."""
+    import studio_lint
+
+    request = json.loads(payload)
+    if not isinstance(request, dict) or not isinstance(request.get("path"), str) or not isinstance(
+        request.get("content"), str
+    ):
+        raise ValueError("diagnostics request needs path and content")
+    return studio_lint.lint(project, request["path"], request["content"])
+
+
 def _hash(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -412,6 +424,8 @@ def main() -> None:
         )
     elif action == "extract-sql" and len(sys.argv) == 4:
         result = extract_sql(project, sys.argv[3], sys.stdin.read())
+    elif action == "diagnostics":
+        result = diagnostics(project, sys.stdin.read())
     else:
         raise ValueError("unsupported bridge action")
     if action == "validate-draft":

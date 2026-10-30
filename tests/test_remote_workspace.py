@@ -319,6 +319,8 @@ class Upstream(BaseHTTPRequestHandler):
             self.reply(200, {"active": ["pipeline job"]})
         elif self.path == "/api/jobs":
             self.reply(202, {"id": "job1", "echo": json.loads(body or "{}")})
+        elif self.path == "/api/diagnostics":
+            self.reply(200, {"diagnostics": [], "echo": json.loads(body or "{}")})
         else:
             self.reply(404, {"error": "unknown endpoint"})
 
@@ -380,6 +382,12 @@ class RemoteGatewayTests(unittest.TestCase):
         self.assertEqual({"action": "run"}, job["echo"])
         status, _ = request(self.port, "/api/nope")
         self.assertEqual(404, status)
+
+    def test_diagnostics_post_is_forwarded_with_body(self):
+        payload = {"path": "seeknal/transforms/a.yml", "content": "kind: transform\n", "version": 3}
+        status, result = request(self.port, "/api/diagnostics", payload)
+        self.assertEqual((200, payload), (status, result["echo"]))
+        self.assertEqual(("POST", "/api/diagnostics"), (Upstream.seen[-1]["method"], Upstream.seen[-1]["path"]))
 
     def test_registry_is_local_and_remote_activity_blocks_switch(self):
         status, workspaces = request(self.port, "/api/workspaces")

@@ -104,6 +104,98 @@ class EditorFlowChecks(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_diagnostic_decorations_and_stale_responses(self):
+        script = r"""
+          const assert = require('node:assert/strict');
+          const {
+            diagnosticsResponseCurrent, nextDiagnosticsState, diagnosticDecorations, splitDecoratedPieces,
+            diagnosticLineSeverities, diagnosticAt, offsetToPosition, positionToOffset,
+            pointerPosition, diagnosticSummary,
+          } = require('./app.js');
+          const at = (line, character) => ({ line, character });
+          const diag = (start, end, severity = 1, message = 'm') => ({ range: { start, end }, severity, message });
+          const content = 'kind: transform\nSELECT a\nFROM b\n\nend';
+
+          // A range over three lines covers the end of the first, all of the middle and the start of the last.
+          assert.deepEqual(diagnosticDecorations(content, [diag(at(0, 6), at(2, 4))]), [
+            { line: 0, start: 6, end: 15, severity: 1 },
+            { line: 1, start: 0, end: 8, severity: 1 },
+            { line: 2, start: 0, end: 4, severity: 1 },
+          ]);
+
+          // Overlaps split into segments that keep the most severe level; equal neighbours merge.
+          assert.deepEqual(diagnosticDecorations(content, [diag(at(1, 0), at(1, 6), 2), diag(at(1, 3), at(1, 8), 1)]), [
+            { line: 1, start: 0, end: 3, severity: 2 },
+            { line: 1, start: 3, end: 8, severity: 1 },
+          ]);
+          assert.deepEqual(diagnosticDecorations(content, [diag(at(1, 0), at(1, 4), 3), diag(at(1, 0), at(1, 8), 3)]), [
+            { line: 1, start: 0, end: 8, severity: 3 },
+          ]);
+
+          // Past the end of a line or the buffer: clamped; empty ranges cover one character.
+          assert.deepEqual(diagnosticDecorations(content, [diag(at(2, 2), at(2, 99))]), [{ line: 2, start: 2, end: 6, severity: 1 }]);
+          assert.deepEqual(diagnosticDecorations(content, [diag(at(2, 40), at(2, 40))]), [{ line: 2, start: 5, end: 6, severity: 1 }]);
+          assert.deepEqual(diagnosticDecorations(content, [diag(at(1, 2), at(1, 2))]), [{ line: 1, start: 2, end: 3, severity: 1 }]);
+          assert.deepEqual(diagnosticDecorations(content, [diag(at(3, 0), at(3, 0)), diag(at(9, 0), at(9, 3))]), []);
+          assert.deepEqual(diagnosticDecorations(content, [diag(at(4, 1), at(12, 0))]), [{ line: 4, start: 1, end: 3, severity: 1 }]);
+
+          // Syntax pieces are cut at segment boundaries without losing text.
+          const pieces = [['SELECT', 'syntax-keyword'], [' a', '']];
+          const fragments = splitDecoratedPieces(pieces, [{ line: 1, start: 3, end: 7, severity: 1 }]);
+          assert.deepEqual(fragments, [
+            { text: 'SEL', className: 'syntax-keyword', segment: -1 },
+            { text: 'ECT', className: 'syntax-keyword', segment: 0 },
+            { text: ' ', className: '', segment: 0 },
+            { text: 'a', className: '', segment: -1 },
+          ]);
+          assert.equal(fragments.map(item => item.text).join(''), 'SELECT a');
+
+          const severities = diagnosticLineSeverities([diag(at(0, 0), at(1, 1), 2), diag(at(1, 0), at(1, 1), 1), diag(at(3, 0), at(30, 0), 3)], 5);
+          assert.deepEqual([...severities.entries()].sort(), [[0, 2], [1, 1], [3, 3], [4, 3]]);
+
+          const items = [diag(at(1, 0), at(1, 6), 2, 'warn'), diag(at(1, 3), at(1, 8), 1, 'err')];
+          assert.equal(diagnosticAt(items, at(1, 4)).message, 'err');
+          assert.equal(diagnosticAt(items, at(1, 1)).message, 'warn');
+          assert.equal(diagnosticAt(items, at(1, 8)).message, 'err');
+          assert.equal(diagnosticAt(items, at(2, 0)), null);
+          assert.equal(diagnosticAt(items, at(-1, 0)), null);
+
+          assert.deepEqual(offsetToPosition(content, 18), at(1, 2));
+          assert.equal(positionToOffset(content, at(1, 2)), 18);
+          assert.equal(positionToOffset(content, at(1, 99)), 24);
+          assert.equal(positionToOffset(content, at(99, 0)), content.lastIndexOf('\n') + 1);
+          assert.deepEqual(pointerPosition({ x: 54, y: 50 }, { left: 10, top: 5, lineHeight: 20, charWidth: 8 }), at(2, 5));
+          assert.equal(diagnosticSummary([diag(at(0, 0), at(0, 1), 1), diag(at(0, 0), at(0, 1), 1), diag(at(0, 0), at(0, 1), 2)]), '2 errors · 1 warning');
+
+          // A response is used only for the buffer version and path it was requested for.
+          const current = { path: 'seeknal/transforms/a.yml', version: 4 };
+          assert.equal(diagnosticsResponseCurrent({ path: 'seeknal/transforms/a.yml', version: 4, diagnostics: [] }, current), true);
+          assert.equal(diagnosticsResponseCurrent({ path: 'seeknal/transforms/a.yml', version: 3, diagnostics: [] }, current), false);
+          assert.equal(diagnosticsResponseCurrent({ path: 'seeknal/transforms/b.yml', version: 4, diagnostics: [] }, current), false);
+          assert.equal(diagnosticsResponseCurrent(null, current), false);
+
+          // "unavailable" keeps the previous diagnostics of the same file and records the reason;
+          // they are stale only when they describe different content.
+          const previous = { path: current.path, items: [diag(at(0, 0), at(0, 4))], contentHash: 'h1', unavailable: null };
+          const kept = nextDiagnosticsState(previous, { path: current.path, version: 4, diagnostics: [], content_sha256: 'h2', unavailable: 'lint timed out after 5 s' }, current);
+          assert.deepEqual(kept, { path: current.path, items: previous.items, contentHash: 'h1', stale: true, unavailable: 'lint timed out after 5 s' });
+          assert.equal(nextDiagnosticsState(previous, { path: current.path, version: 4, content_sha256: 'h1', unavailable: 'busy' }, current).stale, false);
+          assert.equal(nextDiagnosticsState(previous, { path: current.path, version: 4, unavailable: 'request failed' }, current).stale, true);
+          const otherFile = nextDiagnosticsState({ ...previous, path: 'seeknal/transforms/b.yml' }, { path: current.path, version: 4, unavailable: 'busy' }, current);
+          assert.deepEqual([otherFile.items, otherFile.stale], [[], false]);
+          const fresh = nextDiagnosticsState(kept, { path: current.path, version: 4, diagnostics: [], content_sha256: 'h3' }, current);
+          assert.deepEqual(fresh, { path: current.path, items: [], contentHash: 'h3', stale: false, unavailable: null });
+          assert.equal(nextDiagnosticsState(previous, { path: current.path, version: 3, unavailable: 'busy' }, current), null);
+        """
+        result = subprocess.run(
+            ["node", "-e", script],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
