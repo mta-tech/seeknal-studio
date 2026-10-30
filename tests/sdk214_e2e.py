@@ -26,6 +26,7 @@ import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+from local_access import TOKEN_HEADER, link_secret, read_access_link  # noqa: E402
 from runtime_resolver import resolve_runtime  # noqa: E402
 
 
@@ -38,6 +39,8 @@ TERMINAL = {"succeeded", "success", "failed", "cancelled", "canceled"}
 NAME = "sdk214_paid_orders"
 DRAFT = f".seeknal/drafts/draft_transform_{NAME}.yml"
 ACTIVE = f"seeknal/transforms/{NAME}.yml"
+# The launcher's per-launch browser secret, sent as a header by api().
+ACCESS: dict[str, str] = {}
 TRANSFORM = f'''kind: transform
 name: {NAME}
 description: Managed Seeknal 2.14 browser acceptance
@@ -98,7 +101,7 @@ def api(
     request = Request(
         base + path,
         data=json.dumps(payload).encode() if payload is not None else None,
-        headers={"Accept": "application/json", "Content-Type": "application/json", "Origin": base},
+        headers={"Accept": "application/json", "Content-Type": "application/json", "Origin": base, **ACCESS},
         method="POST" if payload is not None else "GET",
     )
     try:
@@ -107,6 +110,15 @@ def api(
     except HTTPError as error:
         detail = json.load(error)
         raise AssertionError(f"{path}: HTTP {error.code}: {detail}") from error
+
+
+def launcher_link(log: Path) -> str:
+    """Wait for launch.py's private one-time link and authorize api() with it."""
+    link = wait_for(
+        lambda: read_access_link(log.read_text(errors="replace")), bool, timeout=120, label="launcher access link",
+    )
+    ACCESS[TOKEN_HEADER] = link_secret(link)
+    return link
 
 
 def wait_for(
@@ -366,7 +378,7 @@ def run_packaged_sdk214(receipt: dict[str, Any]) -> None:
     names = (
         "server.py", "engine_bridge.py", "agent_runtime.py", "agent_worker.py",
         "project_service.py", "environment_service.py", "repl_service.py", "repl_worker.py", "runtime_resolver.py",
-        "launch.py", "index.html", "styles.css", "app.js",
+        "launch.py", "local_access.py", "index.html", "styles.css", "app.js",
     )
     assert_that(executable.is_file(), "final packaged app is missing")
     manifest = {name: sha256(ROOT / name) for name in names}
@@ -389,6 +401,7 @@ def run_packaged_sdk214(receipt: dict[str, Any]) -> None:
         text=True, start_new_session=True,
     )
     try:
+        launcher_link(EVIDENCE / "package.log")
         state = wait_for(
             lambda: api(base, "/api/state", timeout=5)[1],
             lambda value: value.get("seeknal_version") == "2.14.0",
@@ -475,6 +488,7 @@ def main() -> None:
     log_handle: Any = None
     try:
         launcher, log_handle = start_managed(PROJECT_A, port)
+        link = launcher_link(EVIDENCE / "managed.log")
         state_a = wait_for(
             lambda: api(base, "/api/state", timeout=5)[1],
             lambda value: Path(value.get("project_path", "")).resolve() == PROJECT_A.resolve(),
@@ -485,7 +499,7 @@ def main() -> None:
             "state": state_a, "runtime": receipt["runtime"],
         })
         browser(["set", "viewport", "1584", "992"])
-        browser(["open", base])
+        browser(["open", link])
         wait_for(
             lambda: browser_eval("studio?.snapshot?.()"),
             lambda value: bool(value and value.get("nodes") == 3),

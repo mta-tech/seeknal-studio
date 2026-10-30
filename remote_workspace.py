@@ -42,7 +42,7 @@ RUNTIME_SETUP_SECONDS = 900
 SERVER_FILES = (
     "server.py", "engine_bridge.py", "agent_runtime.py", "agent_worker.py",
     "project_service.py", "environment_service.py", "repl_service.py", "repl_worker.py",
-    "runtime_resolver.py", "remote_workspace.py", "remote_host.py", "studio_lint.py",
+    "runtime_resolver.py", "remote_workspace.py", "remote_host.py", "studio_lint.py", "local_access.py",
     "index.html", "styles.css", "app.js", "requirements-runtime.lock.txt",
 )
 _HOST = re.compile(r"(?:[A-Za-z0-9._-]{1,64}@)?[A-Za-z0-9][A-Za-z0-9._-]{0,252}")

@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import hmac
+import http.client
 import json
 import os
 from pathlib import Path
+import secrets
 import signal
 import socket
 import subprocess
@@ -18,13 +21,14 @@ import urllib.request
 import webbrowser
 from typing import NamedTuple, Optional, Tuple, Union
 
+from local_access import LISTEN_FD_ENV, READY_PATH, SECRET_ENV, WINDOW_ENV, bootstrap_url, readiness_proof
 from remote_workspace import RemoteSession, RemoteTarget
 from runtime_resolver import resolve_runtime
 
 ROOT = Path(__file__).resolve().parent
 PRIVATE_ENV = {
     "SEEKNAL_STUDIO_BASELINE_RECEIPT", "SEEKNAL_STUDIO_BASELINE_NONCE",
-    "SEEKNAL_STUDIO_CONTROL_FILE", "SEEKNAL_STUDIO_CONTROL_NONCE",
+    "SEEKNAL_STUDIO_CONTROL_FILE", "SEEKNAL_STUDIO_CONTROL_NONCE", SECRET_ENV, LISTEN_FD_ENV,
 }
 GOVERNANCE_URLS = ("ATLAS_API_URL", "ATLAS_PORTAL_URL")
 WINDOW_ENVIRONMENT_KEYS = {
@@ -49,23 +53,31 @@ class PilotAuthority(NamedTuple):
     definitions: frozenset[str]
 
 
-def available_port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *_args, **_kwargs):
+        return None
 
 
-def wait_ready(process: subprocess.Popen, url: str, timeout: float = 30) -> None:
+# No proxies and no redirects: the probe only ever talks to the launcher's socket.
+_PROBE = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
+
+
+def wait_ready(process: subprocess.Popen, url: str, secret: str, timeout: float = 30) -> None:
+    """Wait until the service proves it holds ``secret``; the probe never sends it."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if process.poll() is not None:
             raise RuntimeError(f"Studio service exited ({process.returncode}); see the service log")
+        challenge = secrets.token_hex(16)
         try:
-            with urllib.request.urlopen(url + "/api/state", timeout=2) as response:
-                if response.status == 200:
-                    return
-        except (urllib.error.URLError, TimeoutError):
+            with _PROBE.open(f"{url}{READY_PATH}?challenge={challenge}", timeout=5) as response:
+                proof = json.load(response).get("proof")
+        except (OSError, http.client.HTTPException, ValueError, AttributeError):
             time.sleep(0.15)
+            continue
+        if isinstance(proof, str) and hmac.compare_digest(proof, readiness_proof(secret, challenge)):
+            return
+        raise RuntimeError("The service on the Studio port could not prove it belongs to this launch")
     raise RuntimeError(f"Studio service did not become ready within {timeout:g} seconds")
 
 
@@ -190,6 +202,15 @@ def read_switch(path: Path, nonce: str) -> Optional[Union[Path, RemoteTarget]]:
         path.unlink(missing_ok=True)
 
 
+def write_access_link(private: Path, url: str) -> Path:
+    """Keep the one-time browser link out of logs; developer tooling reads this file."""
+    path = private / "access-url"
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    with os.fdopen(descriptor, "w") as stream:
+        stream.write(url + "\n")
+    return path
+
+
 def remembered_project() -> Optional[Path]:
     from project_service import default_config_path, validate_project
 
@@ -233,7 +254,13 @@ def main() -> int:
         binary = ROOT.parent / "webframe-evaluation" / "bin" / "webframe"
     if not args.browser and not binary.is_file():
         parser.error("Webframe missing. Set SEEKNAL_WEBFRAME or launch with --browser")
-    port = args.port or available_port()
+    try:
+        # Owned for the whole launch and handed to every service incarnation,
+        # so no other local user can take the port during a restart.
+        listener = socket.create_server(("127.0.0.1", args.port))
+    except OSError as error:
+        parser.error(f"cannot listen on 127.0.0.1:{args.port}: {error}")
+    port = listener.getsockname()[1]
     url = f"http://127.0.0.1:{port}"
     log_dir = Path.home() / "Library" / "Logs" / "Seeknal Studio" if sys.platform == "darwin" else Path.home() / ".local" / "state" / "seeknal-studio"
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -256,6 +283,11 @@ def main() -> int:
             os.chmod(private, 0o700)
             control = private / "switch.json"
             nonce = new_control_nonce()
+            # One browser secret per app launch: workspace switches and
+            # reconnects restart the service on the same port with the same
+            # secret, so the open page's cookie keeps working.
+            ui_secret = secrets.token_urlsafe(32)
+            access_link = write_access_link(private, bootstrap_url(ui_secret, port))
             while True:
                 if isinstance(target, RemoteTarget):
                     print(f"Opening remote workspace {target.location}…", flush=True)
@@ -294,16 +326,19 @@ def main() -> int:
                 env.update({
                     "SEEKNAL_STUDIO_PORT": str(port),
                     "SEEKNAL_STUDIO_CONTROL_FILE": str(control), "SEEKNAL_STUDIO_CONTROL_NONCE": nonce,
+                    SECRET_ENV: ui_secret, LISTEN_FD_ENV: str(listener.fileno()),
                 })
                 if notice:
                     env["SEEKNAL_STUDIO_NOTICE"] = notice
                 notice = None
+                # The previous incarnation has exited (stop() waits), so only
+                # one service accepts on the shared socket at a time.
                 server = subprocess.Popen(
                     [str(runtime.python), str(entrypoint)],
-                    cwd=ROOT, env=env, stdout=log, stderr=log,
+                    cwd=ROOT, env=env, stdout=log, stderr=log, pass_fds=(listener.fileno(),),
                 )
                 try:
-                    wait_ready(server, url, timeout=60 if session is not None else 30)
+                    wait_ready(server, url, ui_secret, timeout=60 if session is not None else 30)
                 except (OSError, RuntimeError) as error:
                     if session is None:
                         raise
@@ -315,13 +350,23 @@ def main() -> int:
                     print(notice, file=sys.stderr, flush=True)
                     target = project
                     continue
-                print(f"Seeknal Studio: {url}\nProject: {label}\nService log: {log_path}", flush=True)
+                print(
+                    f"Seeknal Studio: {url}\nProject: {label}\nService log: {log_path}\nAccess link file: {access_link}",
+                    flush=True,
+                )
                 if args.browser:
                     if not browser_opened:
-                        webbrowser.open(url)
+                        print(
+                            "Note: --browser isolates Studio less on shared machines; the app window is the protected path.",
+                            file=sys.stderr, flush=True,
+                        )
+                        webbrowser.open(bootstrap_url(ui_secret, port))
                         browser_opened = True
                 else:
+                    # Never put the secret on the command line: other users can
+                    # read it there. Webframe exposes WF_* as page globals.
                     window_env = window_environment(baseline)
+                    window_env[WINDOW_ENV] = ui_secret
                     window = subprocess.Popen([str(binary.resolve()), "-w", "1584x992", url], cwd=ROOT, env=window_env, stdout=log, stderr=log)
                 selected = None
                 while selected is None:
@@ -365,6 +410,7 @@ def main() -> int:
         stop(server)
         if session is not None:
             session.stop()
+        listener.close()
 
 
 if __name__ == "__main__":

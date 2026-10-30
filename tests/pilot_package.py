@@ -8,20 +8,37 @@ import os
 from pathlib import Path
 import signal
 import subprocess
+import sys
 import time
 from urllib.error import URLError
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from local_access import TOKEN_HEADER, link_secret, read_access_link  # noqa: E402
+
 PROJECT = ROOT / "pilot" / "workspace"
 EVIDENCE = ROOT / "evidence" / "pilot"
 BUNDLE = ROOT / "dist" / "Seeknal Studio.app"
 BASE = "http://127.0.0.1:18780"
+# The packaged launcher's per-launch browser secret, sent as a header by api().
+ACCESS: dict[str, str] = {}
 
 
 def api(path: str) -> dict:
-    with urlopen(BASE + path, timeout=5) as response:
+    with urlopen(Request(BASE + path, headers=ACCESS), timeout=5) as response:
         return json.load(response)
+
+
+def launcher_secret(process: subprocess.Popen) -> str:
+    """Read launcher output up to the private file holding its one-time link."""
+    output = ""
+    for line in iter(process.stdout.readline, ""):
+        output += line
+        link = read_access_link(output)
+        if link:
+            return link_secret(link)
+    raise AssertionError(f"packaged launcher printed no access link file: {output[-800:]}")
 
 
 def sha256(path: Path) -> str:
@@ -34,7 +51,7 @@ def main() -> None:
     resource = BUNDLE / "Contents" / "Resources" / "studio"
     copied_sources = (
         "server.py", "engine_bridge.py", "project_service.py", "environment_service.py", "repl_service.py",
-        "repl_worker.py", "agent_runtime.py", "agent_worker.py", "launch.py",
+        "repl_worker.py", "agent_runtime.py", "agent_worker.py", "launch.py", "local_access.py",
         "index.html", "styles.css", "app.js",
     )
     manifest = {}
@@ -55,6 +72,7 @@ def main() -> None:
     )
     receipt = {"bundle": str(BUNDLE), "project": str(PROJECT), "source_manifest": manifest}
     try:
+        ACCESS[TOKEN_HEADER] = launcher_secret(process)
         deadline = time.monotonic() + 150
         while time.monotonic() < deadline:
             assert process.poll() is None, "packaged launcher exited during readiness"

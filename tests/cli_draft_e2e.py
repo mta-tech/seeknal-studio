@@ -28,12 +28,17 @@ import yaml
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from local_access import TOKEN_HEADER, link_secret, read_access_link  # noqa: E402
+
 TEMPLATE = ROOT / "pilot" / "template"
 CANONICAL_ROOTS = (ROOT / "pilot" / "template", ROOT / "pilot" / "workspace")
 EVIDENCE = ROOT / "evidence" / "cli-draft"
 PROJECT = EVIDENCE / "project"
 SESSION = "seeknal-cli-draft"
 TERMINAL = {"succeeded", "success", "failed", "cancelled", "canceled"}
+# The packaged launcher's per-launch browser secret, sent as a header by api().
+ACCESS: dict[str, str] = {}
 NAME = "cli_paid_orders"
 DRAFT_RELATIVE = Path(".seeknal/drafts") / f"draft_transform_{NAME}.yml"
 ACTIVE_RELATIVE = Path("seeknal/transforms") / f"{NAME}.yml"
@@ -103,6 +108,7 @@ def api(
             "Accept": "application/json",
             "Content-Type": "application/json",
             "Origin": base,
+            **ACCESS,
         },
         method="POST" if payload is not None else "GET",
     )
@@ -543,7 +549,7 @@ def run_packaged_flow(receipt: dict[str, Any]) -> None:
     resources = bundle / "Contents" / "Resources" / "studio"
     copied_sources = (
         "server.py", "engine_bridge.py", "project_service.py", "environment_service.py", "repl_service.py",
-        "repl_worker.py", "agent_runtime.py", "agent_worker.py", "launch.py",
+        "repl_worker.py", "agent_runtime.py", "agent_worker.py", "launch.py", "local_access.py",
         "index.html", "styles.css", "app.js",
     )
     assert_that(executable.is_file(), "packaged app executable is missing", executable)
@@ -566,6 +572,12 @@ def run_packaged_flow(receipt: dict[str, Any]) -> None:
         start_new_session=True,
     )
     try:
+        # launch.py keeps its one-time browser link in a private file it names.
+        link = wait_for(
+            lambda: read_access_link((EVIDENCE / "package.log").read_text(errors="replace")), bool,
+            timeout=60, label="packaged launcher access link",
+        )
+        ACCESS[TOKEN_HEADER] = link_secret(link)
         state = wait_for(
             lambda: api(base, "/api/state", timeout=5)[1],
             lambda value: Path(value.get("project_path", "")).resolve() == PROJECT.resolve(),
@@ -574,7 +586,7 @@ def run_packaged_flow(receipt: dict[str, Any]) -> None:
         )
         options = api(base, "/api/drafts/options", timeout=40)[1]
         assert_that(any(item.get("value") == "transform" for item in options.get("node_types", [])), "packaged backend omitted real draft metadata", options)
-        app_bytes = urlopen(base + "/app.js", timeout=10).read()
+        app_bytes = urlopen(Request(base + "/app.js", headers=ACCESS), timeout=10).read()
         assert_that(hashlib.sha256(app_bytes).hexdigest() == manifest["app.js"], "packaged HTTP app.js differs from frozen source")
         descendants = subprocess.check_output(["ps", "-axo", "pid=,ppid=,command="], text=True).splitlines()
         webframes = [line.strip() for line in descendants if "Resources/studio/bin/webframe" in line and base in line]

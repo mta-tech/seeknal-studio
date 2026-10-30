@@ -14,6 +14,7 @@ import subprocess
 import sys
 
 import launch
+from local_access import TOKEN_HEADER, WINDOW_ENV, link_secret, read_access_link
 
 
 class ProjectSwitchTests(unittest.TestCase):
@@ -140,7 +141,15 @@ class ProjectSwitchTests(unittest.TestCase):
 
     def test_launcher_restarts_backend_and_window_for_new_project(self):
         webframe = self.root / "fake-webframe"
-        webframe.write_text("#!/usr/bin/env python3\nimport time\ntime.sleep(60)\n")
+        windows = self.root / "windows"
+        windows.mkdir()
+        webframe.write_text(
+            "#!/usr/bin/env python3\nimport json, os, sys, time\n"
+            f"path = os.path.join({str(windows)!r}, str(os.getpid()))\n"
+            f"open(path + '.tmp', 'w').write(json.dumps({{'argv': sys.argv[1:], 'session': os.environ.get({WINDOW_ENV!r})}}))\n"
+            "os.rename(path + '.tmp', path + '.json')\n"
+            "time.sleep(60)\n"
+        )
         webframe.chmod(0o755)
         with socket.socket() as listener:
             listener.bind(("127.0.0.1", 0))
@@ -153,9 +162,11 @@ class ProjectSwitchTests(unittest.TestCase):
             "--webframe", str(webframe),
         ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=environment)
 
+        access: dict[str, str] = {}
+
         def request(path: str, payload: dict | None = None):
             data = json.dumps(payload).encode() if payload is not None else None
-            headers = {"Origin": f"http://127.0.0.1:{port}"}
+            headers = {"Origin": f"http://127.0.0.1:{port}", **access}
             if data is not None:
                 headers["Content-Type"] = "application/json"
             req = Request(
@@ -165,7 +176,21 @@ class ProjectSwitchTests(unittest.TestCase):
             with urlopen(req, timeout=2) as response:
                 return response.status, json.load(response)
 
+        output = ""
         try:
+            for line in iter(process.stdout.readline, ""):
+                output += line
+                link = read_access_link(output)
+                if link:
+                    access[TOKEN_HEADER] = link_secret(link)
+                    break
+            self.assertTrue(access, output)
+            with self.assertRaises(URLError):
+                access_header = access.pop(TOKEN_HEADER)
+                try:
+                    request("/api/state")
+                finally:
+                    access[TOKEN_HEADER] = access_header
             deadline = time.monotonic() + 20
             initial = None
             while time.monotonic() < deadline:
@@ -176,6 +201,8 @@ class ProjectSwitchTests(unittest.TestCase):
                     time.sleep(0.1)
             self.assertIsNotNone(initial)
             self.assertEqual(str(self.pilot), initial["project_path"])
+            while time.monotonic() < deadline and not list(windows.glob("*.json")):
+                time.sleep(0.1)
             status, accepted = request("/api/projects/open", {"path": str(self.ordinary)})
             self.assertEqual(202, status)
             self.assertTrue(accepted["switching"])
@@ -186,11 +213,23 @@ class ProjectSwitchTests(unittest.TestCase):
                     if candidate["project_path"] == str(self.ordinary):
                         switched = candidate
                         break
-                except URLError:
+                except (URLError, ConnectionError):
+                    # The old backend may reset a request while it stops.
                     pass
+                # The launcher keeps the port bound across the restart.
+                with socket.socket() as squatter, self.assertRaises(OSError):
+                    squatter.bind(("127.0.0.1", port))
                 time.sleep(0.1)
             self.assertIsNotNone(switched)
             self.assertNotEqual(initial["runtime_id"], switched["runtime_id"])
+            window_deadline = time.monotonic() + 10
+            while time.monotonic() < window_deadline and len(list(windows.glob("*.json"))) < 2:
+                time.sleep(0.1)
+            opened = [json.loads(path.read_text()) for path in windows.glob("*.json")]
+            secret = access[TOKEN_HEADER]
+            # Both windows got the same launch secret privately, never on argv.
+            self.assertEqual([secret, secret], [item["session"] for item in opened])
+            self.assertFalse(any(secret in " ".join(item["argv"]) for item in opened))
         finally:
             process.terminate()
             try:
@@ -199,10 +238,13 @@ class ProjectSwitchTests(unittest.TestCase):
                 process.kill()
                 process.wait(timeout=5)
             if process.stdout is not None:
+                output += process.stdout.read()
                 process.stdout.close()
             if process.stderr is not None:
+                output += process.stderr.read()
                 process.stderr.close()
         self.assertEqual(0, process.returncode)
+        self.assertNotIn(access[TOKEN_HEADER], output)
 
 
 if __name__ == "__main__":

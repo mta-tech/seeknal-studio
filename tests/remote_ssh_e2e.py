@@ -23,6 +23,9 @@ import urllib.request
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from local_access import TOKEN_HEADER, link_secret, read_access_link  # noqa: E402
+
 EVIDENCE = ROOT / "evidence" / "remote-ssh"
 HOST = os.environ.get("SEEKNAL_REMOTE_E2E_HOST", "fitra@100.73.79.64")
 REMOTE_PATH = os.environ.get("SEEKNAL_REMOTE_E2E_PATH", "~/project/seeknal-studio-remote-demo")
@@ -30,6 +33,8 @@ PORT = int(os.environ.get("SEEKNAL_REMOTE_E2E_PORT", "18871"))
 BASE = f"http://127.0.0.1:{PORT}"
 PYTHON = ROOT / ".runtime" / "venv" / "bin" / "python"
 receipt: dict[str, Any] = {"host": HOST, "remote_path": REMOTE_PATH, "port": PORT, "checks": []}
+# The launcher's per-launch browser secret; the local gateway requires it too.
+ACCESS: dict[str, str] = {}
 
 
 def record(name: str, detail: object) -> None:
@@ -46,7 +51,7 @@ def api(path: str, body: dict | None = None, timeout: float = 120) -> tuple[int,
     data = json.dumps(body).encode() if body is not None else None
     request = urllib.request.Request(
         BASE + path, data=data, method="POST" if data is not None else "GET",
-        headers={"Content-Type": "application/json"} if data is not None else {},
+        headers={**({"Content-Type": "application/json"} if data is not None else {}), **ACCESS},
     )
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -134,6 +139,8 @@ def main() -> int:
             cwd=ROOT, env=env, stdout=log, stderr=log, start_new_session=True,
         )
     try:
+        link = wait(lambda: read_access_link(log_path.read_text(errors="replace")), 60, "launcher access link")
+        ACCESS[TOKEN_HEADER] = link_secret(link)
         wait(lambda: api("/api/state")[0] == 200, 60, "local Studio")
         local_state = api("/api/state")[1]
         record("local project opened", {"project_path": local_state["project_path"], "seeknal": local_state["seeknal_version"]})
@@ -197,6 +204,14 @@ def main() -> int:
         processes = ssh("pgrep -af '[s]eeknal-studio/server/.*/server.py' || true")
         check(unauthenticated == "403", "remote backend rejects requests without the session token", unauthenticated)
         record("remote backend requires session token", {"remote_port": remote_port, "no_token_status": unauthenticated, "processes": processes.splitlines()})
+        try:
+            with urllib.request.urlopen(BASE + "/api/state", timeout=10) as response:
+                gateway_status = response.status
+        except urllib.error.HTTPError as error:
+            gateway_status = error.code
+        check(gateway_status == 403, "local gateway rejects requests without the browser secret", gateway_status)
+        check(ACCESS[TOKEN_HEADER] not in log_path.read_text() + log_text, "browser secret leaked into a log", None)
+        record("local gateway requires the per-launch browser secret", {"no_secret_status": gateway_status})
 
         # Half-open connection (laptop sleep / network change): freeze the local
         # SSH session so heartbeats stop without closing the TCP connection.

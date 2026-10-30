@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import http.client
 import importlib.util
 from http.server import BaseHTTPRequestHandler
 import socketserver
@@ -16,8 +17,10 @@ import threading
 import time
 import unittest
 from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 
+from local_access import LISTEN_FD_ENV, QUERY, SECRET_ENV, cookie_name, cookie_value, readiness_proof
 from project_service import ProjectService
 from remote_workspace import (
     SERVER_FILES, TOKEN_HEADER, RemoteTarget, server_bundle, ssh_command,
@@ -53,7 +56,11 @@ def request(port: int, path: str, payload: dict | None = None, headers: dict | N
         with urlopen(req, timeout=5) as response:
             return response.status, json.load(response)
     except HTTPError as error:
-        return error.code, json.load(error)
+        body = error.read()
+        try:
+            return error.code, json.loads(body)
+        except ValueError:
+            return error.code, {"error": body.decode(errors="replace")}
 
 
 def wait_for(predicate, timeout: float = 30):
@@ -67,6 +74,20 @@ def wait_for(predicate, timeout: float = 30):
             pass
         time.sleep(0.1)
     raise AssertionError("condition not met in time")
+
+
+def launcher_access(process: subprocess.Popen) -> tuple[str, list[str]]:
+    """Read the launcher's private access-link file; return its secret and the stdout read so far."""
+    lines: list[str] = []
+    for line in iter(process.stdout.readline, ""):
+        lines.append(line)
+        if line.startswith("Access link file: "):
+            link = Path(line.removeprefix("Access link file: ").strip())
+            if link.stat().st_mode & 0o077:
+                raise AssertionError("access link file is not private")
+            query = parse_qs(urlparse(link.read_text().strip()).query)
+            return query[QUERY][0], lines
+    raise AssertionError(f"launcher printed no access link file: {''.join(lines)[-800:]}")
 
 
 class RemoteValidationTests(unittest.TestCase):
@@ -273,25 +294,37 @@ class RemoteLauncherFallbackTests(unittest.TestCase):
                 [str(PYTHON), str(ROOT / "launch.py"), "--browser", "--port", str(port), "--project", str(project)],
                 cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             )
+            output = ""
             try:
-                first = wait_for(lambda: request(port, "/api/workspaces")[1])
-                status, saved = request(port, "/api/workspaces", {"name": "Legion", "host": "legion", "path": "/srv/demo"})
+                secret, lines = launcher_access(process)
+                output = "".join(lines)
+                auth = {TOKEN_HEADER: secret}
+                self.assertEqual(403, request(port, "/api/workspaces")[0])
+                first = wait_for(lambda: request(port, "/api/workspaces", headers=auth)[1])
+                status, saved = request(port, "/api/workspaces", {"name": "Legion", "host": "legion", "path": "/srv/demo"}, auth)
                 self.assertEqual(200, status, saved)
-                status, opened = request(port, "/api/workspaces/open", {"id": saved["workspace"]["id"]})
+                status, opened = request(port, "/api/workspaces/open", {"id": saved["workspace"]["id"]}, auth)
                 self.assertEqual(202, status, opened)
+                # The fallback backend is a restart on the same port; the
+                # launch's secret keeps working without a new link.
                 after = wait_for(lambda: (lambda value: value if value["instance"] != first["instance"] else None)(
-                    request(port, "/api/workspaces")[1]
+                    request(port, "/api/workspaces", headers=auth)[1]
                 ), timeout=60)
                 self.assertEqual("local", after["current"]["kind"])
                 self.assertEqual(str(project.resolve()), after["current"]["path"])
                 self.assertIn("Could not open remote workspace Legion", after["notice"])
                 self.assertIn("simulated remote upload failure", after["notice"])
-                state = request(port, "/api/state")[1]
+                state = request(port, "/api/state", headers=auth)[1]
                 self.assertEqual(after["notice"], state["notice"])
             finally:
                 process.terminate()
-                process.communicate(timeout=30)
+                stdout, stderr = process.communicate(timeout=30)
             self.assertEqual(0, process.returncode)
+            output += stdout + stderr
+            self.assertIn("Access link file: ", output)
+            self.assertNotIn(secret, output)
+            for log in (Path.home() / "Library" / "Logs" / "Seeknal Studio").glob(f"studio-{port}.log"):
+                self.assertNotIn(secret, log.read_text(errors="replace"))
 
 
 class Upstream(BaseHTTPRequestHandler):
@@ -310,7 +343,8 @@ class Upstream(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length).decode() if length else None
         Upstream.seen.append({"method": method, "path": self.path, "host": self.headers.get("Host"),
-                              "token": self.headers.get(TOKEN_HEADER), "body": body})
+                              "token": self.headers.get(TOKEN_HEADER), "cookie": self.headers.get("Cookie"),
+                              "body": body})
         if self.headers.get(TOKEN_HEADER) != self.token:
             self.reply(403, {"error": "loopback origin required"})
         elif self.path == "/api/state":
@@ -334,14 +368,19 @@ class Upstream(BaseHTTPRequestHandler):
         del format, args
 
 
-class RemoteGatewayTests(unittest.TestCase):
+class GatewayHarness(unittest.TestCase):
+    ui_secret: str | None = None
+    # Serve on a listening socket handed over like launch.py does.
+    shared_listener = False
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         socket_path = str(self.root / "upstream.sock")
         self.upstream = socketserver.ThreadingUnixStreamServer(socket_path, Upstream)
         threading.Thread(target=self.upstream.serve_forever, daemon=True).start()
-        self.port = free_port()
+        self.listener = socket.create_server(("127.0.0.1", 0)) if self.shared_listener else None
+        self.port = self.listener.getsockname()[1] if self.listener else free_port()
         target = RemoteTarget("legion", "/srv/demo", None, "w1", "Legion")
         env = dict(os.environ)
         env.update(
@@ -354,19 +393,36 @@ class RemoteGatewayTests(unittest.TestCase):
             SEEKNAL_STUDIO_REMOTE_PORT="40123",
             SEEKNAL_STUDIO_REMOTE_TOKEN=Upstream.token,
         )
+        env.pop(SECRET_ENV, None)
+        if self.ui_secret:
+            env[SECRET_ENV] = self.ui_secret
+        if self.listener:
+            env[LISTEN_FD_ENV] = str(self.listener.fileno())
+        self.env = env
         Upstream.seen = []
-        self.gateway = subprocess.Popen([str(PYTHON), str(ROOT / "remote_gateway.py")], cwd=ROOT, env=env,
-                                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
-        wait_for(lambda: request(self.port, "/api/workspaces")[0] == 200)
+        self.start_gateway()
+        ready = {TOKEN_HEADER: self.ui_secret} if self.ui_secret else None
+        wait_for(lambda: request(self.port, "/api/workspaces", headers=ready)[0] == 200)
         Upstream.seen = []
+
+    def start_gateway(self):
+        self.gateway = subprocess.Popen(
+            [str(PYTHON), str(ROOT / "remote_gateway.py")], cwd=ROOT, env=self.env,
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+            pass_fds=(self.listener.fileno(),) if self.listener else (),
+        )
 
     def tearDown(self):
         self.gateway.terminate()
         self.gateway.communicate(timeout=10)
+        if self.listener:
+            self.listener.close()
         self.upstream.shutdown()
         self.upstream.server_close()
         self.temporary.cleanup()
 
+
+class RemoteGatewayTests(GatewayHarness):
     def test_state_is_proxied_with_token_and_annotated(self):
         status, state = request(self.port, "/api/state")
         self.assertEqual(200, status)
@@ -410,6 +466,94 @@ class RemoteGatewayTests(unittest.TestCase):
         self.assertIn("unreachable", payload["error"])
         # Unreachable hosts report no active work, so the user can switch away.
         self.assertTrue(request(self.port, "/api/workspaces")[1]["can_switch"])
+
+
+class RemoteGatewayBrowserAccessTests(GatewayHarness):
+    ui_secret = "gateway-ui-secret-0123456789abcdefghijklmnopq"
+
+    def raw(self, path, method="GET", headers=None, body=None):
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        try:
+            connection.request(method, path, body=body, headers=headers or {})
+            response = connection.getresponse()
+            return response.status, dict(response.getheaders()), response.read()
+        finally:
+            connection.close()
+
+    def cookie(self):
+        return {"Cookie": f"{cookie_name(self.port)}={cookie_value(self.ui_secret, self.port)}"}
+
+    def test_missing_or_wrong_secret_is_refused_before_proxying(self):
+        for headers in ({}, {TOKEN_HEADER: "wrong"}, {TOKEN_HEADER: Upstream.token},
+                        {"Cookie": f"{cookie_name(self.port + 1)}={cookie_value(self.ui_secret, self.port)}"}):
+            for path in ("/", "/app.js", "/api/state", "/api/workspaces", f"/api/state?{QUERY}={self.ui_secret}"):
+                with self.subTest(headers=headers, path=path):
+                    status, response_headers, body = self.raw(path, headers=headers)
+                    self.assertEqual(403, status)
+                    self.assertIn(b"Open Seeknal Studio from the app", body)
+                    self.assertNotIn("Set-Cookie", response_headers)
+            status, _, _ = self.raw("/api/jobs", "POST", {**headers, "Content-Type": "application/json"}, b"{}")
+            self.assertEqual(403, status)
+        self.assertEqual([], Upstream.seen)
+
+    def test_bootstrap_sets_cookie_and_cookie_is_not_forwarded_upstream(self):
+        status, headers, _ = self.raw(f"/?{QUERY}={self.ui_secret}")
+        self.assertEqual((303, "/"), (status, headers["Location"]))
+        self.assertTrue(headers["Set-Cookie"].startswith(
+            f"{cookie_name(self.port)}={cookie_value(self.ui_secret, self.port)}; HttpOnly; SameSite=Strict; Path=/"
+        ))
+        self.assertEqual(200, self.raw("/", headers=self.cookie())[0])
+        status, state = request(self.port, "/api/state", headers=self.cookie())
+        self.assertEqual((200, "legion"), (status, state["remote"]["host"]))
+        status, job = request(self.port, "/api/jobs", {"action": "run"}, headers=self.cookie())
+        self.assertEqual(202, status)
+        self.assertEqual(2, len(Upstream.seen))
+        for seen in Upstream.seen:
+            self.assertIsNone(seen["cookie"])
+            self.assertEqual(Upstream.token, seen["token"])
+
+    def test_header_token_is_accepted(self):
+        status, _ = request(self.port, "/api/state", headers={TOKEN_HEADER: self.ui_secret})
+        self.assertEqual(200, status)
+        self.assertEqual(Upstream.token, Upstream.seen[-1]["token"])
+
+    def test_head_needs_the_secret(self):
+        self.assertEqual(403, self.raw("/app.js", "HEAD")[0])
+        self.assertEqual(403, self.raw("/", "HEAD")[0])
+        self.assertEqual(200, self.raw("/app.js", "HEAD", self.cookie())[0])
+
+    def test_readiness_challenge_proves_the_secret_without_credentials(self):
+        challenge = "ab" * 16
+        status, _, body = self.raw(f"/api/ready?challenge={challenge}")
+        self.assertEqual(200, status)
+        self.assertEqual(readiness_proof(self.ui_secret, challenge), json.loads(body)["proof"])
+        self.assertNotIn(self.ui_secret.encode(), body)
+        self.assertEqual(400, self.raw("/api/ready?challenge=short")[0])
+        self.assertEqual([], Upstream.seen)
+
+
+class GatewayListenerHandoffTests(GatewayHarness):
+    ui_secret = "gateway-ui-secret-0123456789abcdefghijklmnopq"
+    shared_listener = True
+
+    def test_restart_keeps_the_port_and_serves_queued_requests(self):
+        auth = {TOKEN_HEADER: self.ui_secret}
+        self.assertEqual(200, request(self.port, "/api/state", headers=auth)[0])
+        self.gateway.terminate()
+        self.gateway.communicate(timeout=10)
+        # Between incarnations nobody else can bind the port...
+        with socket.socket() as squatter, self.assertRaises(OSError):
+            squatter.bind(("127.0.0.1", self.port))
+        # ...and a request made in the gap waits in the backlog for the next one.
+        queued: dict = {}
+        waiting = threading.Thread(target=lambda: queued.update(result=request(self.port, "/api/state", headers=auth)))
+        waiting.start()
+        time.sleep(0.5)
+        self.assertTrue(waiting.is_alive())
+        self.start_gateway()
+        waiting.join(timeout=30)
+        self.assertEqual(200, queued["result"][0])
+        self.assertEqual("legion", queued["result"][1]["remote"]["host"])
 
 
 class InstallLoaderTests(unittest.TestCase):

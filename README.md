@@ -57,6 +57,19 @@ The normal launcher preserves the project's governance environment, including At
 
 Both launchers select an available loopback port, start the Studio service, wait for readiness, and open Webframe. Closing the window stops the owned service and agent process. On macOS, service logs are stored under `~/Library/Logs/Seeknal Studio/`.
 
+### Local access token
+
+Each app launch creates a random browser secret and hands it to the local service (or SSH gateway) through a private environment variable. A loopback request is served only when it carries the port-scoped `seeknal_studio_<port>` cookie (HttpOnly, SameSite=Strict) or the secret in the `X-Seeknal-Studio-Token` header; anything else gets `403 Open Seeknal Studio from the app`, so other users and processes on this machine cannot drive Studio. The browser obtains the cookie once from `http://127.0.0.1:<port>/?studio_session=<secret>`, which redirects to `/`; the query is never accepted on `/api` paths. Webframe receives the secret through its environment rather than its command line, and `--browser` opens the one-time link. If cookies are blocked, the window tries the bootstrap once per tab and then shows the message.
+
+The launcher binds the loopback port once and hands that listening socket to every service incarnation, so the port is never free during a workspace switch or reconnect; requests made during a restart wait in the socket backlog. The same secret is reused for the whole launch. The launcher's readiness probe sends no credential: the service answers a random challenge with an HMAC proof that it holds the secret.
+
+The secret and link are never printed or logged. Developer tooling reads the link from `access-url` (mode 0600) in the launcher's private 0700 directory, whose path the launcher prints as `Access link file: …`; the file is removed when the launcher exits. A service started directly with `server.py` and no `SEEKNAL_STUDIO_UI_SECRET` keeps the earlier unauthenticated loopback behaviour for development.
+
+Limitations:
+
+- The app window (Webframe) is the protected path. With `--browser`, the browser sends the Studio cookie to every `127.0.0.1` port, because cookies ignore ports, so a page another local user serves on another loopback port can capture and replay it. Use `--browser` only on a single-user machine. On Linux, `xdg-open` also briefly exposes the one-time link in its command line (macOS passes it to `osascript` on stdin).
+- Webframe exposes the secret as the `STUDIO_SESSION` page global to any top-level page it shows, for example a link or file dropped onto the window.
+
 ## Owned AI agent
 
 Studio starts its own agent worker. You do not need to start a separate Seeknal gateway or export a gateway URL.

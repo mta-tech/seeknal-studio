@@ -16,12 +16,13 @@ import difflib
 import hmac
 import re
 import tempfile
-from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer  # noqa: F401 - route tests serve Handler with it
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 
+from local_access import SECRET_ENV, BrowserAccess, NoStoreMixin, http_server
 from project_service import ProjectService
 from environment_service import (
     EnvironmentBusyError,
@@ -53,6 +54,9 @@ HOSTS = {f"127.0.0.1:{PORT}", f"localhost:{PORT}"}
 # host cannot drive this loopback service. Pop it so child processes never
 # inherit it.
 ACCESS_TOKEN = os.environ.pop("SEEKNAL_STUDIO_ACCESS_TOKEN", None)
+# Local launches also require the launcher's per-launch browser secret so other
+# users and processes on this machine cannot drive Studio.
+BROWSER_ACCESS = BrowserAccess(os.environ.pop(SECRET_ENV, None))
 NOTICE = os.environ.pop("SEEKNAL_STUDIO_NOTICE", None)
 ORIGINS = {f"http://127.0.0.1:{PORT}", f"http://localhost:{PORT}"}
 STATIC = {"index.html", "styles.css", "app.js"}
@@ -1364,7 +1368,7 @@ def gateway_request(path: str, payload: dict | None = None, timeout: int = 30) -
         raise RuntimeError(f"gateway unavailable: {error.reason}") from error
 
 
-class Handler(SimpleHTTPRequestHandler):
+class Handler(NoStoreMixin, SimpleHTTPRequestHandler):
     server_version = "SeeknalStudio/0.1"
 
     def trusted(self) -> bool:
@@ -1395,9 +1399,18 @@ class Handler(SimpleHTTPRequestHandler):
             raise ValueError("JSON object required")
         return data
 
+    def do_HEAD(self) -> None:
+        if not self.trusted():
+            self.send_json({"error": "loopback origin required"}, 403)
+            return
+        if BROWSER_ACCESS.admit(self, PORT):
+            super().do_HEAD()
+
     def do_GET(self) -> None:
         if not self.trusted():
             self.send_json({"error": "loopback origin required"}, 403)
+            return
+        if not BROWSER_ACCESS.admit(self, PORT, bootstrap=True):
             return
         parsed = urlparse(self.path)
         try:
@@ -1515,6 +1528,8 @@ class Handler(SimpleHTTPRequestHandler):
     def do_POST(self) -> None:
         if not self.trusted():
             self.send_json({"error": "loopback origin required"}, 403)
+            return
+        if not BROWSER_ACCESS.admit(self, PORT):
             return
         try:
             data = self.payload()
@@ -1791,7 +1806,7 @@ def main() -> None:
         raise SystemExit("Resolved Seeknal SDK 2.14.0 runtime is incomplete")
     if not PROJECT.is_dir():
         raise SystemExit(f"Project does not exist: {PROJECT}")
-    server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    server = http_server(PORT, Handler)
     if PORT == 0:
         # Remote (SSH) backends bind an OS-assigned port so no other user can
         # race for a pre-selected one, then report it through a private file.

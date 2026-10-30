@@ -11,12 +11,13 @@ from __future__ import annotations
 import http.client
 import json
 import os
-from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from http.server import SimpleHTTPRequestHandler
 from pathlib import Path
 import signal
 import threading
 from urllib.parse import urlparse
 
+from local_access import SECRET_ENV, BrowserAccess, NoStoreMixin, http_server
 from project_service import ProjectService
 from remote_workspace import TOKEN_HEADER, RemoteTarget, unix_request
 
@@ -31,6 +32,9 @@ REMOTE = RemoteTarget.from_json(json.loads(os.environ.get("SEEKNAL_STUDIO_REMOTE
 UPSTREAM_SOCKET = os.environ.get("SEEKNAL_STUDIO_REMOTE_SOCKET", "")
 UPSTREAM_HOST = f"127.0.0.1:{os.environ.get('SEEKNAL_STUDIO_REMOTE_PORT', '')}"
 TOKEN = os.environ.pop("SEEKNAL_STUDIO_REMOTE_TOKEN", "")
+# The browser proves itself with the launcher's per-launch secret; only the
+# remote token above, never the browser cookie, travels upstream.
+BROWSER_ACCESS = BrowserAccess(os.environ.pop(SECRET_ENV, None))
 NOTICE = os.environ.pop("SEEKNAL_STUDIO_NOTICE", None)
 WORK_ACCEPTANCE_LOCK = threading.RLock()
 
@@ -77,7 +81,7 @@ def remote_state(payload: dict) -> dict:
     return payload
 
 
-class Handler(SimpleHTTPRequestHandler):
+class Handler(NoStoreMixin, SimpleHTTPRequestHandler):
     server_version = "SeeknalStudioGateway/0.1"
 
     def trusted(self) -> bool:
@@ -118,9 +122,18 @@ class Handler(SimpleHTTPRequestHandler):
                 pass
         self.send_body(status, content_type, response)
 
+    def do_HEAD(self) -> None:
+        if not self.trusted():
+            self.send_json({"error": "loopback origin required"}, 403)
+            return
+        if BROWSER_ACCESS.admit(self, PORT):
+            super().do_HEAD()
+
     def do_GET(self) -> None:
         if not self.trusted():
             self.send_json({"error": "loopback origin required"}, 403)
+            return
+        if not BROWSER_ACCESS.admit(self, PORT, bootstrap=True):
             return
         parsed = urlparse(self.path)
         if parsed.path == "/api/projects":
@@ -137,6 +150,8 @@ class Handler(SimpleHTTPRequestHandler):
     def do_POST(self) -> None:
         if not self.trusted():
             self.send_json({"error": "loopback origin required"}, 403)
+            return
+        if not BROWSER_ACCESS.admit(self, PORT):
             return
         try:
             raw = self.body()
@@ -189,7 +204,7 @@ class Handler(SimpleHTTPRequestHandler):
 def main() -> None:
     if not UPSTREAM_SOCKET or not TOKEN:
         raise SystemExit("remote gateway requires an upstream socket and session token")
-    server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    server = http_server(PORT, Handler)
 
     def shutdown(_signum: int, _frame: object) -> None:
         raise SystemExit(0)

@@ -27,6 +27,9 @@ import yaml
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from local_access import TOKEN_HEADER, link_secret, read_access_link  # noqa: E402
+
 PILOT_TEMPLATE = ROOT / "pilot" / "template"
 PILOT_WORKSPACE = ROOT / "pilot" / "workspace"
 EVIDENCE = ROOT / "evidence" / "ide-workflow"
@@ -38,6 +41,8 @@ BASE = "http://127.0.0.1:18782"
 PORT = 18782
 SESSION = "seeknal-ide-workflow"
 TRANSFORM = Path("seeknal/transforms/customer_value_pilot.yml")
+# The current launcher's per-launch browser secret, sent as a header by api().
+ACCESS: dict[str, str] = {}
 TERMINAL = {"succeeded", "failed", "cancelled", "canceled", "success"}
 AI_REQUEST = (
     "Add average_order_value to the selected transform SQL as AVG(o.amount) while preserving "
@@ -90,6 +95,7 @@ def api(
             "Content-Type": "application/json",
             "Accept": "application/json",
             "Origin": base,
+            **ACCESS,
         },
         method="POST" if payload is not None else "GET",
     )
@@ -121,6 +127,15 @@ def wait_for(
             pass
         time.sleep(0.25)
     raise AssertionError(f"timed out waiting for {label}: {last!r}")
+
+
+def launcher_link(log: Path) -> str:
+    """Wait for launch.py's private one-time link and authorize api() with it."""
+    link = wait_for(
+        lambda: read_access_link(log.read_text(errors="replace")), bool, timeout=120, label="launcher access link",
+    )
+    ACCESS[TOKEN_HEADER] = link_secret(link)
+    return link
 
 
 def wait_api(path: str, predicate: Callable[[dict[str, Any]], bool], timeout: float, label: str) -> dict[str, Any]:
@@ -339,9 +354,10 @@ def manual_snapshot_regression() -> None:
                 text=True,
                 start_new_session=True,
             )
+        link = launcher_link(log_path)
         wait_api("/api/state", lambda value: Path(value.get("project_path", "")).resolve() == PROJECT_B.resolve(), 45, "manual regression host")
         browser(["set", "viewport", "1584", "992"])
-        browser(["open", BASE])
+        browser(["open", link])
         browser_eval(
             "new Promise((resolve,reject)=>{let n=0;const t=setInterval(()=>{const s=studio?.snapshot();"
             "if(s?.selectedFile?.endsWith('customer_value_pilot.yml')){clearInterval(t);resolve(s)}"
@@ -487,6 +503,7 @@ def main(*, replay_ai_proposal: bool = False) -> None:
                 text=True,
                 start_new_session=True,
             )
+        link = launcher_link(server_log)
         initial_state = wait_api("/api/state", lambda value: Path(value.get("project_path", "")).resolve() == PROJECT_A.resolve(), 45, "managed project A")
         projects = api("/api/projects")[1]
         assert_that(projects.get("managed") is True and projects.get("can_switch") is True, "managed launcher did not enable switching", projects)
@@ -508,7 +525,7 @@ def main(*, replay_ai_proposal: bool = False) -> None:
         })
 
         browser(["set", "viewport", "1584", "992"])
-        browser(["open", BASE])
+        browser(["open", link])
         browser_eval(
             "new Promise((resolve,reject)=>{let n=0;const t=setInterval(()=>{const s=studio?.snapshot();"
             "if(s?.agentReady&&s.nodes===3&&s.selectedFile?.endsWith('customer_value_pilot.yml')){clearInterval(t);resolve(s)}"
