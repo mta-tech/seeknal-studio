@@ -70,6 +70,35 @@ class WorkspaceFrontendContractTests(unittest.TestCase):
         self.assertEqual(busy_branch.count("await loadEnvironment()"), 1)
         self.assertIn("entered values remain in this form", busy_branch)
 
+    def test_environment_save_keeps_the_other_studio_message_on_screen(self):
+        save_environment = function_body(self.app, "saveEnvironment")
+        harness = f"""
+const assert = require('assert');
+const elements = new Map();
+const $ = selector => {{ if (!elements.has(selector)) elements.set(selector, {{disabled:false, textContent:''}}); return elements.get(selector); }};
+const $$ = () => [];
+const state = {{ environment: {{ contentHash: 'h' }} }};
+const statuses = [];
+const setStatus = (message, tone) => statuses.push({{message, tone}});
+const showError = error => setStatus(error.message, 'error');
+let reloaded = 0;
+const loadEnvironment = async () => {{ reloaded += 1; }};
+const renderEnvironment = () => {{ throw new Error('must not render on failure'); }};
+const busy = "Another Studio is running 'run' in this project (fitra on legion, pid 1234, since 10:42). Try again when it finishes.";
+const api = async () => {{ const error = new Error(busy); error.status = 409; error.payload = {{error: busy, error_code: 'project_busy'}}; throw error; }};
+{save_environment}
+saveEnvironment({{ preventDefault() {{}} }}).then(() => {{
+  const last = statuses[statuses.length - 1];
+  assert.equal(last.tone, 'error');
+  assert.ok(last.message.startsWith(busy), last.message);
+  assert.ok(last.message.includes('Entered values remain in this form'));
+  assert.equal($('#environment-status').textContent, 'Busy · values preserved');
+  assert.equal(reloaded, 0);
+}}).catch(error => {{ console.error(error); process.exit(1); }});
+"""
+        result = subprocess.run(["node"], input=harness, text=True, capture_output=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_resizers_support_pointer_keyboard_and_accessible_values(self):
         self.assertIn('id="workspace-resizer"', self.html)
         self.assertIn('id="repl-resizer"', self.html)

@@ -2882,6 +2882,10 @@ async function saveEnvironment(event) {
     if (error.status === 409 && error.payload?.error_code === "environment_conflict") {
       await loadEnvironment();
       setStatus("Environment changed on disk. Metadata was refreshed; re-enter unsaved values before saving.", "error");
+    } else if (error.status === 409 && error.payload?.error_code === "project_busy") {
+      // Another Studio holds the project: keep its explanation on screen.
+      $("#environment-status").textContent = "Busy · values preserved";
+      setStatus(`${error.message} Entered values remain in this form.`, "error");
     } else if (error.status === 409) {
       $("#environment-status").textContent = "Busy · values preserved";
       setStatus("Project work is active. Stop it, then retry; entered values remain in this form.", "error");

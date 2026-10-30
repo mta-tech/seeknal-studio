@@ -24,7 +24,7 @@ def main():
         'server.py', 'engine_bridge.py', 'agent_runtime.py', 'agent_worker.py',
         'project_service.py', 'environment_service.py', 'repl_service.py', 'repl_worker.py',
         'runtime_resolver.py', 'launch.py', 'index.html', 'styles.css', 'app.js',
-        'remote_workspace.py', 'remote_host.py', 'remote_gateway.py', 'studio_lint.py', 'local_access.py',
+        'remote_workspace.py', 'remote_host.py', 'remote_gateway.py', 'studio_lint.py', 'local_access.py', 'project_lock.py',
         'requirements-runtime.lock.txt',
     ):
         shutil.copy2(ROOT / name, resource / name)

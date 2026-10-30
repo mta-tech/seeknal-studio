@@ -23,6 +23,7 @@ from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 
 from local_access import SECRET_ENV, BrowserAccess, NoStoreMixin, http_server
+from project_lock import ProjectBusyError, ProjectLock
 from project_service import ProjectService
 from environment_service import (
     EnvironmentBusyError,
@@ -369,6 +370,10 @@ def freshness_fingerprint(sources: str | None = None) -> str:
 
 
 STUDIO_STATE = PROJECT / "target" / "studio_state.json"
+# Excludes every other Studio backend on this project, in addition to the
+# threading locks that serialize work inside this one. Held only while an
+# operation runs.
+PROJECT_LOCK = ProjectLock(PROJECT)
 
 
 def save_successful_fingerprint(value: str) -> None:
@@ -640,25 +645,45 @@ class JobStore:
         confirmed: bool = False, draft_request: dict | None = None,
     ) -> dict:
         with WORK_ACCEPTANCE_LOCK:
-            job_id = uuid.uuid4().hex[:12]
-            job = {
-                "id": job_id, "action": action, "node": node, "path": path,
-                "content_hash": content_hash, "destination_hash": destination_hash,
-                "confirmed": confirmed, "status": "queued",
-                "draft_request": dict(draft_request) if draft_request is not None else None,
-                "logs": "", "exit_code": None, "created_at": time.time(),
-                "started_at": None, "finished_at": None,
-            }
-            with self.lock:
-                if (
-                    action == "validate-draft"
-                    and isinstance(path, str)
-                    and isinstance(content_hash, str)
-                ):
-                    self.validated_drafts.discard((path, content_hash))
-                self.jobs[job_id] = job
-            threading.Thread(target=self._execute, args=(job_id,), daemon=True).start()
+            # Every job runs the Seeknal CLI or rewrites drafts/pipelines, so it
+            # is refused here, with the holder named, while another Studio works.
+            lease = PROJECT_LOCK.acquire(action)
+            job_id = None
+            try:
+                job_id = uuid.uuid4().hex[:12]
+                job = {
+                    "id": job_id, "action": action, "node": node, "path": path,
+                    "content_hash": content_hash, "destination_hash": destination_hash,
+                    "confirmed": confirmed, "status": "queued",
+                    "draft_request": dict(draft_request) if draft_request is not None else None,
+                    "logs": "", "exit_code": None, "created_at": time.time(),
+                    "started_at": None, "finished_at": None,
+                }
+                with self.lock:
+                    if (
+                        action == "validate-draft"
+                        and isinstance(path, str)
+                        and isinstance(content_hash, str)
+                    ):
+                        self.validated_drafts.discard((path, content_hash))
+                    self.jobs[job_id] = job
+                threading.Thread(target=self._execute_holding, args=(job_id, lease), daemon=True).start()
+            except BaseException:
+                # Nothing will run: give the project back at once. (Release is
+                # idempotent, so a started thread could not release it twice.)
+                lease.release()
+                with self.lock:
+                    self.jobs.pop(job_id, None)
+                raise
             return dict(job)
+
+    def _execute_holding(self, job_id: str, lease) -> None:
+        # The lease covers the queue wait too, so no other Studio slips in
+        # between acceptance and execution; it ends on every outcome.
+        try:
+            self._execute(job_id)
+        finally:
+            lease.release()
 
     def _execute(self, job_id: str) -> None:
         with self.execution_lock:
@@ -741,9 +766,12 @@ class JobStore:
                 command.extend(["--nodes", node])
             process: subprocess.Popen[str] | None = None
             try:
+                # The job process shares the lock: if this backend is killed, an
+                # orphaned run still keeps other Studios out until it exits.
                 process = subprocess.Popen(
                     command, cwd=PROJECT, env=clean_environment(), stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT, text=True, shell=False, start_new_session=True,
+                    pass_fds=PROJECT_LOCK.inherited_fds(),
                 )
                 with self.lock:
                     self.processes[job_id] = process
@@ -1547,6 +1575,11 @@ class Handler(NoStoreMixin, SimpleHTTPRequestHandler):
                     self.send_json({"error": f"{busy}; save after it finishes"}, 409)
                     return
                 try:
+                    lease = PROJECT_LOCK.acquire("save")
+                except BaseException:
+                    JOBS.execution_lock.release()
+                    raise
+                try:
                     # Someone else (another Studio, a terminal, git) may have
                     # changed the file since it was opened: never overwrite that.
                     if file_hash(target) != base_hash:
@@ -1566,6 +1599,7 @@ class Handler(NoStoreMixin, SimpleHTTPRequestHandler):
                         temporary.unlink(missing_ok=True)
                     saved_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
                 finally:
+                    lease.release()
                     JOBS.execution_lock.release()
                 fresh = JOBS.last_successful_fingerprint == freshness_fingerprint()
                 self.send_json({
@@ -1577,9 +1611,10 @@ class Handler(NoStoreMixin, SimpleHTTPRequestHandler):
                     self.send_json({"error": "Active work must finish before preparing editor changes"}, 409)
                     return
                 try:
-                    result = prepare_editor_snapshot(
-                        data.get("path"), data.get("content"), data.get("original_content"),
-                    )
+                    with PROJECT_LOCK.acquire("prepare edits"):
+                        result = prepare_editor_snapshot(
+                            data.get("path"), data.get("content"), data.get("original_content"),
+                        )
                 finally:
                     JOBS.execution_lock.release()
                 status = 201 if result.get("snapshot", {}).get("mode") == "active" else 200
@@ -1589,7 +1624,8 @@ class Handler(NoStoreMixin, SimpleHTTPRequestHandler):
                     self.send_json({"error": "Active work must finish before creating a draft"}, 409)
                     return
                 try:
-                    result = create_editor_draft(data.get("path"), data.get("content"))
+                    with PROJECT_LOCK.acquire("create draft"):
+                        result = create_editor_draft(data.get("path"), data.get("content"))
                 finally:
                     JOBS.execution_lock.release()
                 self.send_json(result, 201)
@@ -1631,7 +1667,8 @@ class Handler(NoStoreMixin, SimpleHTTPRequestHandler):
                 try:
                     with WORK_ACCEPTANCE_LOCK:
                         repl_was_ready = REPL.status().get("ready") is True
-                        result = ENVIRONMENT.update(data)
+                        with PROJECT_LOCK.acquire("save environment"):
+                            result = ENVIRONMENT.update(data)
                         if repl_was_ready:
                             reloaded = REPL.reload()
                 except EnvironmentBusyError as error:
@@ -1776,6 +1813,8 @@ class Handler(NoStoreMixin, SimpleHTTPRequestHandler):
                 self.send_json({"error": "unknown endpoint"}, 404)
         except EditorConflictError as error:
             self.send_json({"error": safe_agent_error(error), "error_code": "editor_conflict"}, 409)
+        except ProjectBusyError as error:
+            self.send_json({"error": str(error), "error_code": "project_busy", "holder": error.holder}, 409)
         except (json.JSONDecodeError, ValueError, RuntimeError) as error:
             self.send_json({"error": safe_agent_error(error)}, 400)
 
