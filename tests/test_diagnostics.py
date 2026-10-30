@@ -122,7 +122,7 @@ class LintTests(unittest.TestCase):
         self.assertEqual([(1, "sql-syntax", 6, 40, 6, 41)], brief(self.sql("SELECT * FROM source.orders WHERE x = = 1")))
 
     def test_templates_keep_positions_and_soften_syntax_errors(self):
-        self.assertEqual([], self.sql("SELECT * FROM source.orders WHERE d > '{{ start }}' AND n = {{ n }}")["diagnostics"])
+        self.assertEqual([], self.sql("SELECT * FROM source.orders WHERE ordered_at > '{{ start }}' AND amount = {{ n }}")["diagnostics"])
         self.assertEqual([], self.sql("SELECT * FROM source_{{ env }}")["diagnostics"])
         self.assertEqual(
             [(1, "unknown-table", 6, 48, 6, 60)],
@@ -382,8 +382,8 @@ class LintTests(unittest.TestCase):
         self.assertEqual([(1, "python-syntax", 0, 12, 0, 13)], brief(python))
 
     def test_multiline_templates_are_masked(self):
-        result = self.sql("SELECT * FROM input_0 WHERE d > {{\n start }} AND x IN (SELECT 1 FROM nope)")
-        line = " start }} AND x IN (SELECT 1 FROM nope)"
+        result = self.sql("SELECT * FROM input_0 WHERE ordered_at > {{\n start }} AND amount IN (SELECT 1 FROM nope)")
+        line = " start }} AND amount IN (SELECT 1 FROM nope)"
         start = 2 + line.index("nope")
         self.assertEqual([(1, "unknown-table", 7, start, 7, start + 4)], brief(result))
 
@@ -416,6 +416,288 @@ class LintTests(unittest.TestCase):
             self.skipTest(f"Seeknal SDK unavailable: {error}")
         self.assertEqual(SCHEMAS, studio_lint.SCHEMAS)
         self.assertEqual(set(DAGBuilder.KIND_MAP), set(studio_lint.SCHEMAS))
+
+
+class ColumnTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.temporary = tempfile.TemporaryDirectory()
+        cls.project = copy_demo(Path(cls.temporary.name))
+        seeknal = cls.project / "seeknal"
+        files = {
+            "transforms/all_orders.yml": "kind: transform\nname: all_orders\ninputs:\n  - ref: source.orders\n"
+                                         "transform: SELECT * EXCLUDE (status) FROM source.orders\n",
+            "transforms/all_again.yml": "kind: transform\nname: all_again\ninputs:\n  - ref: transform.all_orders\n"
+                                        "transform: SELECT * FROM transform.all_orders\n",
+            "transforms/loop_a.yml": "kind: transform\nname: loop_a\ninputs:\n  - ref: transform.loop_b\n"
+                                     "transform: SELECT * FROM transform.loop_b\n",
+            "transforms/loop_b.yml": "kind: transform\nname: loop_b\ninputs:\n  - ref: transform.loop_a\n"
+                                     "transform: SELECT * FROM transform.loop_a\n",
+            "sources/raw.yml": "kind: source\nname: raw\nsource: csv\ntable: data/raw.csv\n",
+            "sources/logged.yml": "kind: source\nname: logged\nsource: csv\ntable: data/logged.csv\n",
+            "sources/partial.yml": "kind: source\nname: partial\nsource: csv\ntable: data/p.csv\n"
+                                   "columns:\n  id: {dtype: string}\n",
+            "sources/linked.yml": "kind: source\nname: linked\nsource: csv\ntable: data/l.csv\n",
+            "sources/folder.yml": "kind: source\nname: folder\nsource: csv\ntable: data/f.csv\n",
+            "sources/junk.yml": "kind: source\nname: junk\nsource: csv\ntable: data/j.csv\n",
+            "pipelines/enrich.py": "from seeknal.pipeline import source\n\n"
+                                   "@source(name='typed', columns={'id': 'string', 'score': 'double'})\n"
+                                   "def typed(ctx):\n    return None\n",
+        }
+        for relative, content in files.items():
+            (seeknal / relative).parent.mkdir(parents=True, exist_ok=True)
+            (seeknal / relative).write_text(content)
+        import pyarrow as arrow
+        import pyarrow.parquet as parquet
+
+        output = cls.project / "target" / "intermediate"
+        output.mkdir(parents=True)
+        parquet.write_table(arrow.table({"event_id": [1], "event_at": ["2026-01-01"]}), output / "source_logged.parquet")
+        # Declared columns list only `id`; the last run proves `id` and `extra` exist.
+        parquet.write_table(arrow.table({"id": ["a"], "extra": [1]}), output / "source_partial.parquet")
+        outside = Path(cls.temporary.name) / "outside.parquet"
+        parquet.write_table(arrow.table({"secret": [1]}), outside)
+        (output / "source_linked.parquet").symlink_to(outside)
+        (output / "source_folder.parquet").mkdir()
+        with open(output / "source_junk.parquet", "wb") as junk:
+            junk.seek(50_000_000)
+            junk.write(b"not parquet")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.temporary.cleanup()
+
+    def sql(self, sql: str, inputs: tuple[str, ...] = ("source.orders", "source.customers")) -> dict:
+        header = "kind: transform\nname: x\ninputs:\n" + "".join(f"  - ref: {ref}\n" for ref in inputs)
+        content = header + "transform: |\n" + "".join(f"  {line}\n" for line in sql.split("\n"))
+        return studio_lint.lint(self.project, "seeknal/transforms/x.yml", content)
+
+    def line(self, result: dict) -> list[tuple]:
+        """(severity, code, character, end, origin, first suggestion) on the first SQL line."""
+        return [
+            (item["severity"], item["code"], item["range"]["start"]["character"], item["range"]["end"]["character"],
+             item.get("data", {}).get("schema_origin"), (item.get("data", {}).get("suggestions") or [None])[0])
+            for item in result["diagnostics"]
+        ]
+
+    def test_declared_columns_only_give_warnings(self):
+        # Seeknal does not project sources to their declared columns, so a miss
+        # against declared-only columns is a warning, never an error.
+        result = self.sql("SELECT o.amout, segmnt FROM source.orders o JOIN source.customers c USING (customer_id)")
+        self.assertEqual(
+            [(2, "unknown-column", 11, 16, "declared", "amount"), (2, "unknown-column", 18, 24, "declared", "segment")],
+            self.line(result),
+        )
+        self.assertEqual(
+            "Column 'amout' is not in the declared columns of source.orders. Did you mean 'amount'?",
+            result["diagnostics"][0]["message"],
+        )
+        self.assertEqual(
+            "Column 'segmnt' not found in source.orders or source.customers. Did you mean 'segment'? "
+            "(declared columns may be incomplete)",
+            result["diagnostics"][1]["message"],
+        )
+
+    def test_inferred_columns_and_star_propagation_through_two_transforms(self):
+        # SELECT * over a declared-only source inherits its uncertainty: warnings.
+        result = self.sql("SELECT a.amount, a.amout, a.status FROM transform.all_again a", ("transform.all_again",))
+        self.assertEqual(
+            [(2, "unknown-column", 21, 26, "inferred", "amount"), (2, "unknown-column", 30, 36, "inferred", None)],
+            self.line(result),
+        )
+        self.assertIn("inferred from declared columns, which may be incomplete", result["diagnostics"][0]["message"])
+        # Explicit select lists are complete: errors.
+        ltv = self.sql("SELECT l.segmnt FROM transform.customer_ltv l", ("transform.customer_ltv",))
+        self.assertEqual([(1, "unknown-column", 11, 17, "inferred", "segment")], self.line(ltv))
+        self.assertEqual(
+            "Column 'segmnt' not found in transform.customer_ltv. Did you mean 'segment'?", ltv["diagnostics"][0]["message"],
+        )
+
+    def test_select_aliases_ctes_and_duckdb_forms_are_not_flagged(self):
+        cases = [
+            "SELECT amount * 2 AS doubled, doubled + 1 AS more FROM source.orders\n"
+            "WHERE doubled > 1 GROUP BY doubled HAVING doubled > 0 ORDER BY more",
+            "WITH paid AS (SELECT order_id AS id, amount FROM source.orders) SELECT id, paid.amount FROM paid",
+            "WITH paid(i, a) AS (SELECT order_id, amount FROM source.orders) SELECT i, a FROM paid",
+            "SELECT * EXCLUDE (status) REPLACE (amount * 2 AS amount) FROM source.orders",
+            "SELECT {'a': amount}.a AS s, s.a, list_transform([amount], z -> z + 1) AS l FROM source.orders",
+            "SELECT COLUMNS('am.*'), struct_pack(k := amount), rowid FROM source.orders",
+            "SELECT status, count(*) AS n FROM source.orders GROUP BY ALL ORDER BY ALL",
+            "SELECT o.order_id FROM source.orders o WHERE EXISTS (\n"
+            "SELECT 1 FROM source.customers c WHERE c.customer_id = o.customer_id AND segment <> status)",
+            "SELECT d.total FROM (SELECT customer_id, sum(amount) AS total FROM source.orders GROUP BY ALL) d",
+            "SELECT * FROM source.orders o, (SELECT o.amount + 1 AS bumped) t",
+            "SELECT order_id FROM source.orders QUALIFY row_number() OVER (PARTITION BY customer_id ORDER BY amount) = 1",
+            'SELECT "AMOUNT", O.Order_Id FROM source.orders o',
+            "SELECT anything FROM read_csv('data/x.csv')",
+            "CREATE TABLE t AS SELECT * FROM source.orders;\nSELECT whatever FROM t",
+            "SELECT input_0.amount, input_1.segment FROM input_0 JOIN input_1 USING (customer_id)",
+            "SELECT order_id FROM source.orders UNION ALL SELECT customer_id FROM source.customers",
+        ]
+        for sql in cases:
+            with self.subTest(sql):
+                self.assertEqual([], self.sql(sql)["diagnostics"])
+
+    def test_cte_and_derived_table_outputs_are_checked(self):
+        self.assertEqual(
+            [(1, "unknown-column", 78, 84, "inferred", "amount")],
+            self.line(self.sql("WITH paid AS (SELECT order_id AS id, amount FROM source.orders) SELECT paid.amonut FROM paid")),
+        )
+        renamed = self.sql("WITH paid(i, a) AS (SELECT order_id, amount FROM source.orders) SELECT paid.amount FROM paid")
+        self.assertEqual("unknown-column", renamed["diagnostics"][0]["code"])
+
+    def test_quoted_identifiers_and_placeholders_resolve_to_their_node(self):
+        self.assertEqual([(2, "unknown-column", 11, 18, "declared", "amount")], self.line(self.sql('SELECT o."amout" FROM source.orders o')))
+        self.assertEqual([(2, "unknown-column", 11, 16, "declared", "amount")], self.line(self.sql("SELECT r.amout FROM ref('source.orders') r")))
+        self.assertEqual([(2, "unknown-column", 17, 22, "declared", "amount")], self.line(self.sql("SELECT input_0.amout FROM input_0")))
+        self.assertEqual([(2, "unknown-column", 9, 14, "declared", "amount")], self.line(self.sql("SELECT amout FROM __THIS__", ("source.orders",))))
+        mapping = "kind: transform\nname: x\ninputs:\n  o: ref:source.orders\ntransform: SELECT t.amout FROM $o t\n"
+        result = studio_lint.lint(self.project, "seeknal/transforms/x.yml", mapping)
+        self.assertEqual(["inputs-mapping", "unknown-column"], [item["code"] for item in result["diagnostics"]])
+        self.assertEqual("amount", result["diagnostics"][1]["data"]["suggestions"][0])
+
+    def test_unknown_upstream_columns_only_produce_one_info(self):
+        result = self.sql("SELECT r.anything, r.other, nothing FROM source.raw r", ("source.raw",))
+        self.assertEqual([(3, "columns-unknown", 43, 53, None, None)], self.line(result))
+        self.assertIn("Columns of source.raw are unknown", result["diagnostics"][0]["message"])
+        cycle = self.sql("SELECT l.whatever FROM transform.loop_a l", ("transform.loop_a",))
+        self.assertEqual(["columns-unknown"], [item["code"] for item in cycle["diagnostics"]])
+
+    def test_last_run_parquet_schema_gives_warnings(self):
+        result = self.sql("SELECT l.event_id, l.event_ts FROM source.logged l", ("source.logged",))
+        self.assertEqual([(2, "unknown-column", 23, 31, "last_run", "event_at")], self.line(result))
+        self.assertTrue(result["diagnostics"][0]["message"].endswith("(from last run)"))
+
+    def test_last_run_schema_wins_over_declared_columns(self):
+        result = self.sql("SELECT p.id, p.extra, p.nope FROM source.partial p", ("source.partial",))
+        self.assertEqual([(2, "unknown-column", 26, 30, "last_run", None)], self.line(result))
+        self.assertIn("(from last run)", result["diagnostics"][0]["message"])
+
+    def test_parquet_footer_reader_matches_pyarrow(self):
+        import pyarrow as arrow
+        import pyarrow.parquet as parquet
+
+        tables = {
+            "flat": arrow.table({"a": [1], "b": ["x"], "c": [1.5], "d": [True]}),
+            "nested": arrow.table({
+                "id": [1], "s": [{"x": 1, "y": {"z": "q"}}], "l": [[1, 2]],
+                "m": arrow.array([[("k", 1)]], type=arrow.map_(arrow.string(), arrow.int64())), "after": [2],
+            }),
+            "unicode": arrow.table({"héllo😀": [1], "Mixed Case": [2]}),
+            "wide": arrow.table({f"c{index}": [index] for index in range(300)}),
+        }
+        folder = Path(self.temporary.name) / "footers"
+        folder.mkdir(exist_ok=True)
+        for name, table in tables.items():
+            for compression in ("snappy", "none"):
+                with self.subTest(name=name, compression=compression):
+                    path = folder / f"{name}-{compression}.parquet"
+                    parquet.write_table(table, path, compression=compression)
+                    self.assertEqual(parquet.read_schema(path).names, studio_lint.parquet_columns(path))
+
+    def test_hostile_parquet_footers_terminate_quickly(self):
+        import struct
+
+        def varint(value: int) -> bytes:
+            out = b""
+            while True:
+                low, value = value & 0x7F, value >> 7
+                if not value:
+                    return out + bytes([low])
+                out += bytes([low | 0x80])
+
+        def wrap(footer: bytes) -> bytes:
+            return b"PAR1" + footer + struct.pack("<I", len(footer)) + b"PAR1"
+
+        folder = Path(self.temporary.name) / "hostile"
+        folder.mkdir(exist_ok=True)
+        cases = {
+            "map-of-booleans": wrap(b"\x1b" + varint(2 ** 60) + b"\x11\x00"),
+            "empty-structs-16mb": wrap(b"\x29\xfc" + varint(2 ** 40) + b"\x00" * 15_900_000),
+            "huge-list": wrap(b"\x29\xfc" + varint(2 ** 60) + b"\x00" * 1000),
+            "deep-nesting": wrap(b"\x1c" * 100_000 + b"\x00" * 100_000),
+            "huge-binary": wrap(b"\x29\x1c\x48" + varint(2 ** 62) + b"x\x00"),
+            "length-past-file": b"PAR1\x00\x00\x00\x00" + struct.pack("<I", 0xFFFFFFFF) + b"PAR1",
+        }
+        for name, data in cases.items():
+            with self.subTest(name):
+                path = folder / f"{name}.parquet"
+                path.write_bytes(data)
+                started = time.perf_counter()
+                self.assertIsNone(studio_lint.parquet_columns(path))
+                self.assertLess(time.perf_counter() - started, 1)
+        fifo = folder / "fifo.parquet"
+        os.mkfifo(fifo)
+        started = time.perf_counter()
+        self.assertIsNone(studio_lint.parquet_columns(fifo))
+        self.assertLess(time.perf_counter() - started, 1)
+
+    def test_unusable_parquet_files_mean_unknown_columns(self):
+        for name in ("linked", "folder", "junk"):
+            with self.subTest(name):
+                started = time.perf_counter()
+                result = self.sql(f"SELECT x.anything, x.secret FROM source.{name} x", (f"source.{name}",))
+                self.assertLess(time.perf_counter() - started, 1)
+                self.assertEqual(["columns-unknown"], [item["code"] for item in result["diagnostics"]])
+
+    def test_last_run_read_never_follows_a_linked_parent_directory(self):
+        import pyarrow as arrow
+        import pyarrow.parquet as parquet
+
+        base = Path(self.temporary.name) / "linked-parent"
+        project, outside = base / "project", base / "outside"
+        (project / "target").mkdir(parents=True)
+        outside.mkdir()
+        parquet.write_table(arrow.table({"secret": [1]}), outside / "source_x.parquet")
+        # target/intermediate is a link to a folder outside the project.
+        (project / "target" / "intermediate").symlink_to(outside, target_is_directory=True)
+        self.assertEqual(["secret"], studio_lint.parquet_columns(outside / "source_x.parquet"))
+        self.assertIsNone(studio_lint.last_run_columns(project, "source.x"))
+        (project / "target" / "intermediate").unlink()
+        (project / "target" / "intermediate").mkdir()
+        parquet.write_table(arrow.table({"inside": [1]}), project / "target" / "intermediate" / "source_x.parquet")
+        self.assertEqual(["inside"], studio_lint.last_run_columns(project, "source.x"))
+        for node in ("...x", "..x", "./x", "source/x.y", ".x"):
+            with self.subTest(node=node):
+                self.assertIsNone(studio_lint.last_run_columns(project, node))
+
+    def test_set_operations_star_modifiers_and_bound_names(self):
+        cases = [
+            "SELECT name FROM (SELECT order_id FROM source.orders UNION BY NAME SELECT order_id, segment AS name FROM source.customers)",
+            "WITH u AS (SELECT order_id FROM source.orders UNION ALL BY NAME SELECT segment FROM source.customers)\n"
+            "SELECT u.segment, u.order_id FROM u",
+            "SELECT renamed FROM (SELECT * RENAME (amount AS renamed) FROM source.orders)",
+            "SELECT [x + 1 FOR x IN [amount] IF x > 0] AS y FROM source.orders",
+            "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3) SELECT n, r.n FROM r",
+            "SELECT amount.x FROM source.orders AS amount",
+            "SELECT * FROM source.orders o, (SELECT o.amount AS a) WHERE a > 1",
+        ]
+        for sql in cases:
+            with self.subTest(sql):
+                self.assertEqual([], self.sql(sql)["diagnostics"])
+        renamed = self.sql("SELECT amount FROM (SELECT * RENAME (amount AS renamed) FROM source.orders)")
+        self.assertEqual([(2, "unknown-column", 9, 15, "inferred", None)], self.line(renamed))
+        recursive = self.sql("WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3) SELECT m FROM r")
+        self.assertEqual([(1, "unknown-column", 85, 86, "inferred", None)], self.line(recursive))
+
+    def test_unaliased_subquery_is_named_in_messages(self):
+        result = self.sql("SELECT nope FROM (SELECT order_id AS id FROM source.orders)")
+        self.assertEqual("Column 'nope' not found in the subquery", result["diagnostics"][0]["message"])
+
+    def test_python_nodes_use_literal_decorator_columns(self):
+        result = self.sql("SELECT t.score, t.scroe FROM source.typed t", ("source.typed",))
+        self.assertEqual([(2, "unknown-column", 20, 25, "declared", "score")], self.line(result))
+
+    def test_feature_group_sql_has_no_column_checks(self):
+        content = (
+            "kind: feature_group\nname: x\nentity: customer\nmaterialization: {}\n"
+            "inputs:\n  - ref: source.orders\ntransform: SELECT nothing FROM source\n"
+        )
+        self.assertEqual([], studio_lint.lint(self.project, "seeknal/feature_groups/x.yml", content)["diagnostics"])
+
+    def test_column_positions_are_utf16(self):
+        result = self.sql("SELECT '😀' AS e, o.amout FROM source.orders o")
+        self.assertEqual([(2, "unknown-column", 22, 27, "declared", "amount")], self.line(result))
 
 
 class BridgeTests(unittest.TestCase):
