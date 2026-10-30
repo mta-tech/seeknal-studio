@@ -1,0 +1,17 @@
+kind: source
+name: orders
+description: Commerce orders
+source: csv
+table: data/orders.csv
+columns:
+  order_id:
+    dtype: string
+  customer_id:
+    dtype: string
+  amount:
+    dtype: integer
+  status:
+    dtype: string
+  ordered_at:
+    dtype: date
+tags: [commerce, studio-demo]

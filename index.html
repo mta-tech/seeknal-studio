@@ -1,0 +1,308 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Seeknal Studio</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="titlebar">
+      <div class="titlebar-menu">
+      <div class="window-controls" aria-hidden="true"><i></i><i></i><i></i></div>
+      <a class="wordmark" href="#" aria-label="Seeknal Studio home">Seeknal <span>Studio</span></a>
+      <nav class="app-menu" role="menubar" aria-label="Application menu">
+        <div class="menu-group"><button class="menu-trigger" type="button" role="menuitem" aria-haspopup="true" aria-expanded="false">File</button><div class="menu-popover" role="menu" hidden>
+          <button id="menu-open-project" type="button" role="menuitem">Add Workspace… <kbd>⌘O</kbd></button>
+          <button id="menu-new-node" type="button" role="menuitem">New pipeline node…</button>
+          <button id="menu-recent-projects" type="button" role="menuitem" aria-haspopup="menu" aria-expanded="false">Saved Workspaces <span>›</span></button>
+          <div id="recent-project-menu" class="menu-sublist" role="menu" aria-label="Saved workspaces" hidden></div>
+          <button id="menu-save" type="button" role="menuitem">Save <kbd>⌘S</kbd></button>
+        </div></div>
+        <div class="menu-group"><button class="menu-trigger" type="button" role="menuitem" aria-haspopup="true" aria-expanded="false">View</button><div class="menu-popover" role="menu" hidden>
+          <button id="menu-view-pipeline" type="button" role="menuitem">Pipeline</button><button id="menu-view-repl" type="button" role="menuitem">SQL REPL</button><button id="menu-view-agent" type="button" role="menuitem">Agent</button>
+        </div></div>
+        <div class="menu-group"><button class="menu-trigger" type="button" role="menuitem" aria-haspopup="true" aria-expanded="false">Run</button><div class="menu-popover" role="menu" hidden>
+          <button id="menu-dry-run" type="button" role="menuitem">Dry run changes</button><button id="menu-apply" type="button" role="menuitem">Save validated changes</button><button id="menu-run" type="button" role="menuitem">Run pipeline</button>
+        </div></div>
+      </nav>
+      </div>
+      <div class="titlebar-tools">
+      <button id="project-info-button" class="context-chip project-chip" type="button" title="Show project information">
+        <svg viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="7" ry="3"/><path d="M5 5v7c0 1.7 3.1 3 7 3s7-1.3 7-3V5M5 12v7c0 1.7 3.1 3 7 3s7-1.3 7-3v-7"/></svg>
+        <span id="project-name">Loading project</span>
+      </button>
+      <div class="workspace-switcher">
+        <button id="workspace-menu-trigger" class="context-chip workspace-menu-trigger" type="button" aria-haspopup="menu" aria-expanded="false">
+          <svg viewBox="0 0 24 24"><path d="M3 6h7l2 2h9v11H3V6Z"/></svg>
+          <span id="workspace-menu-label">Workspace</span><span class="workspace-chevron" aria-hidden="true">⌄</span>
+        </button>
+        <div id="workspace-menu" class="workspace-menu" role="menu" aria-label="Saved workspaces" hidden>
+          <div class="workspace-menu-heading"><strong>Quick Open</strong><small id="workspace-menu-mode">Loading…</small></div>
+          <div id="workspace-menu-list" class="workspace-menu-list"></div>
+          <button id="manage-workspaces" class="workspace-manage" type="button" role="menuitem">Manage Workspaces…</button>
+        </div>
+      </div>
+      <div class="context-chip environment-chip"><span class="environment-dot"></span><span id="environment-label">Local</span></div>
+      <div class="title-spacer"></div>
+      <label class="command-search">
+        <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="6"/><path d="m16 16 4 4"/></svg>
+        <input id="global-search" type="search" placeholder="Search nodes and files…" autocomplete="off">
+        <kbd>⌘ K</kbd>
+      </label>
+      <button id="agent-toggle" class="icon-button agent-toggle" type="button" aria-label="Toggle agent panel">
+        <svg viewBox="0 0 24 24"><path d="M12 3 14 9l6 2-6 2-2 6-2-6-6-2 6-2 2-6Z"/></svg>
+      </button>
+      <button id="run-button" class="run-button" type="button">
+        <svg viewBox="0 0 24 24"><path d="m8 5 11 7-11 7V5Z"/></svg>
+        <span>Run pipeline</span>
+      </button>
+      </div>
+    </header>
+
+    <div class="workspace">
+      <nav class="activity-rail" aria-label="Workspace views">
+        <button id="files-nav" class="rail-button active" type="button" aria-label="Files" title="Toggle file explorer"><svg viewBox="0 0 24 24"><path d="M5 3h9l5 5v13H5V3Z"/><path d="M14 3v6h5"/></svg></button>
+        <button id="pipeline-nav" class="rail-button" type="button" aria-label="Pipeline" title="Focus pipeline graph"><svg viewBox="0 0 24 24"><circle cx="5" cy="12" r="2"/><circle cx="18" cy="5" r="2"/><circle cx="18" cy="19" r="2"/><path d="M7 12h4c4 0 3-7 5-7M11 12c4 0 3 7 5 7"/></svg></button>
+        <button id="runs-nav" class="rail-button" type="button" aria-label="Runs" title="Show run logs"><svg viewBox="0 0 24 24"><path d="m8 5 11 7-11 7V5Z"/></svg></button>
+        <button id="data-nav" class="rail-button" type="button" aria-label="SQL REPL" title="Open SQL REPL data exploration"><svg viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="7" ry="3"/><path d="M5 5v7c0 1.7 3.1 3 7 3s7-1.3 7-3V5M5 12v7c0 1.7 3.1 3 7 3s7-1.3 7-3v-7"/></svg></button>
+        <div class="rail-spacer"></div>
+        <button id="settings-nav" class="rail-button" type="button" aria-label="Settings" title="Project and gateway settings"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19 13.5v-3l-2-.7-.8-1.8.9-1.9L15 4l-1.9.9-1.9-.8-.7-2h-3l-.7 2-1.8.8L3 4 1 6.1 1.9 8 1 9.8l-2 .7v3l2 .7.9 1.8L1 18l2 2 2-.9 1.8.8.7 2h3l.7-2 1.9-.8 1.9.9 2.1-2-.9-2 .8-1.8 2-.7Z" transform="translate(2) scale(.83)"/></svg></button>
+      </nav>
+
+      <aside class="explorer panel">
+        <div class="panel-heading"><span>Files</span><button id="collapse-explorer" class="quiet-icon" type="button" aria-label="Collapse explorer">‹</button></div>
+        <div class="project-root"><svg viewBox="0 0 24 24"><path d="M3 6h7l2 2h9v11H3V6Z"/></svg><strong id="tree-root">seeknal</strong></div>
+        <div class="explorer-section-heading"><span>Pipeline files</span></div>
+        <div id="file-tree" class="file-tree" aria-label="Project files"><div class="skeleton-row"></div><div class="skeleton-row short"></div></div>
+        <div class="explorer-section-heading drafts-heading"><span>Drafts</span><button id="draft-editor" type="button">+ New draft</button></div>
+        <div id="explorer-drafts" class="draft-tree" aria-label="Pipeline drafts"><div class="draft-tree-empty">Loading drafts…</div></div>
+        <div class="explorer-meta">
+          <span>ENGINE</span>
+          <strong id="engine-version">Checking…</strong>
+          <small id="project-path">Local project</small>
+        </div>
+      </aside>
+      <div id="workspace-resizer" class="vertical-resizer" role="separator" aria-label="Resize file explorer" aria-orientation="vertical" aria-valuemin="150" aria-valuemax="440" aria-valuenow="220" tabindex="0"></div>
+
+      <main class="studio-main">
+        <div id="editor-groups" class="editor-groups" data-split="false">
+          <section class="editor-group active" data-group="left" aria-label="Left editor group">
+            <header class="editor-group-header">
+              <div class="editor-tabstrip" role="tablist" aria-label="Open views in left editor group"></div>
+              <div class="editor-group-actions">
+                <button type="button" data-group-action="move-left" title="Move active tab left" aria-label="Move active tab left">←</button>
+                <button type="button" data-group-action="move-right" title="Move active tab right" aria-label="Move active tab right">→</button>
+                <button type="button" data-group-action="split-right" title="Split editor right" aria-label="Split editor right">▥</button>
+                <button type="button" data-group-action="merge" title="Merge editor groups" aria-label="Merge editor groups">⊣</button>
+              </div>
+            </header>
+            <div class="editor-group-content">
+
+        <section id="repl-workbench" class="repl-workbench" hidden aria-label="Seeknal SQL REPL">
+          <aside class="repl-sidebar">
+            <div class="repl-heading"><div><span>SEEKNAL REPL</span><strong id="repl-binding">Not started</strong></div><span id="repl-status" class="repl-status offline">Offline</span></div>
+            <div class="repl-sidebar-actions"><button id="repl-start" type="button">Start REPL</button><button id="repl-reload" type="button">Reload outputs</button></div>
+            <section><h3>Tables &amp; schemas</h3><div id="repl-tables" class="repl-list"><p>Start the project-bound REPL to inspect outputs.</p></div></section>
+            <section><h3>Session history</h3><div id="repl-history" class="repl-list"><p>No queries in this browser session.</p></div></section>
+          </aside>
+          <div class="repl-main" id="repl-main">
+            <div class="repl-toolbar"><span>SQL editor</span><small id="repl-query-meta">Current project outputs only</small><button id="repl-cancel" class="danger" type="button" hidden>Cancel</button><button id="repl-run" type="button">Run <kbd>⌘↵</kbd></button></div>
+            <textarea id="repl-editor" spellcheck="false" aria-label="SQL REPL query" placeholder="SELECT * FROM output_name LIMIT 20;"></textarea>
+            <div id="repl-resizer" class="horizontal-resizer" role="separator" aria-label="Resize SQL editor and results" aria-orientation="horizontal" aria-valuemin="110" aria-valuemax="600" aria-valuenow="260" tabindex="0"></div>
+            <div class="repl-result-head"><strong>Results</strong><span id="repl-result-status">No query run</span><button id="repl-results-focus" class="text-button" type="button" aria-pressed="false">Focus results</button></div>
+            <div id="repl-results" class="repl-results"><div class="empty-state">Run SQL or a REPL command: .tables, .schema table, .help</div></div>
+          </div>
+        </section>
+
+        <section class="pipeline-stage">
+          <div class="stage-header">
+            <div>
+              <h1 id="pipeline-title">Pipeline workspace</h1>
+              <p id="pipeline-breadcrumb">Loading project graph…</p>
+              <div class="metric-row"><span id="node-count">— nodes</span><span id="edge-count">— dependencies</span><span id="graph-state" class="graph-state">syncing</span></div>
+            </div>
+            <div class="graph-tools">
+              <label><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="6"/><path d="m16 16 4 4"/></svg><input id="graph-search" type="search" placeholder="Search nodes…"></label>
+              <button id="reset-graph" class="icon-button" type="button" aria-label="Reset graph search"><svg viewBox="0 0 24 24"><path d="M4 12a8 8 0 1 0 2-5.3L4 9"/><path d="M4 4v5h5"/></svg></button>
+              <button id="fit-graph" class="text-button" type="button">Fit</button>
+              <button id="layout-graph" class="text-button" type="button">Auto layout</button>
+              <button id="open-selected-editor" class="text-button" type="button">Open YAML</button>
+              <button id="refresh-graph" class="icon-button" type="button" aria-label="Refresh graph"><svg viewBox="0 0 24 24"><path d="M4 12a8 8 0 0 1 13-6l2 2"/><path d="M19 3v5h-5M20 12a8 8 0 0 1-13 6l-2-2"/><path d="M5 21v-5h5"/></svg></button>
+            </div>
+          </div>
+          <div id="graph-canvas" class="graph-canvas" role="group" aria-label="Pipeline lineage graph">
+            <svg id="graph-edges" class="graph-edges" aria-hidden="true"></svg>
+            <div id="graph-nodes" class="graph-nodes"><div class="graph-empty">Loading pipeline graph…</div></div>
+          </div>
+        </section>
+
+        <section class="workbench-split" aria-label="YAML editor workspace">
+          <div class="editor-pane">
+            <div class="pane-tabbar">
+              <span class="pane-tab active"><svg viewBox="0 0 24 24"><path d="M5 3h9l5 5v13H5V3Z"/><path d="M14 3v6h5"/></svg><span id="editor-title">Select a pipeline file</span></span>
+              <div class="pane-actions editor-actions"><span id="save-status">No file</span><button id="editor-focus" class="text-button" type="button" aria-pressed="false">Focus</button><div class="editor-tools"><button id="draft-menu-trigger" class="text-button" type="button" aria-label="Editor utilities" aria-haspopup="menu" aria-expanded="false" disabled>Tools ···</button><div id="draft-action-menu" class="action-menu" role="menu" hidden><button id="draft-sql-ai" type="button" role="menuitem">Draft SQL with AI</button><button id="send-sql-repl" type="button" role="menuitem">Send SQL to REPL</button></div></div></div>
+            </div>
+            <div class="editor-wrap">
+              <pre id="line-numbers" aria-hidden="true">1</pre>
+              <pre id="syntax-layer" class="syntax-layer" aria-hidden="true"></pre>
+              <textarea id="code-editor" aria-label="Pipeline code editor" spellcheck="false" disabled placeholder="Select a file from the explorer or graph."></textarea>
+            </div>
+            <div id="editor-flow" class="editor-flow" hidden>
+              <div class="editor-flow-copy"><span id="editor-flow-label">Saved</span><small id="editor-flow-detail">Active pipeline file</small></div>
+              <button id="save-button" class="editor-flow-primary" type="button">Dry run changes</button>
+            </div>
+          </div>
+        </section>
+
+        <section class="run-dock logs-page">
+          <div class="dock-tabs">
+            <span class="dock-label">All jobs <b id="job-count">0</b></span>
+            <span class="dock-label">Problems <b id="problem-count">0</b></span>
+            <div class="dock-spacer"></div>
+            <button id="validate-button" class="dock-action" type="button">Validate</button>
+            <button id="cancel-button" class="dock-action danger" type="button" hidden>Cancel</button>
+          </div>
+          <div class="logs-workspace"><aside><div class="logs-list-title">Jobs in this Studio process</div><div id="logs-job-list" class="logs-job-list"></div></aside><div class="logs-output"><div class="run-summary">
+            <div id="run-indicator" class="run-indicator idle"><svg viewBox="0 0 24 24"><path d="m7 12 3 3 7-7"/></svg></div>
+            <div class="run-copy"><strong id="run-title">No run started</strong><span id="run-detail">Pipeline execution appears here</span></div>
+            <div id="node-progress" class="node-progress"></div>
+            <button id="log-toggle" class="text-button" type="button">Focus output</button>
+          </div>
+          <pre id="job-logs" class="job-logs">No logs yet.</pre></div></div>
+        </section>
+
+        <section id="configuration-page" class="configuration-page" aria-label="Environment configuration">
+          <header><div><span class="eyebrow">PROJECT ENVIRONMENT</span><h1>Configuration</h1><p>Runtime identity, agent setup, and secret-safe environment variables for this project.</p></div><button id="environment-refresh" class="text-button" type="button">Refresh</button></header>
+          <div class="configuration-grid">
+            <section class="configuration-card workspaces-card">
+              <div class="workspaces-heading"><div><h2>Workspaces</h2><p>Saved names point to one Seeknal project directory, local or on an SSH host. Changing a saved path does not switch projects.</p></div><button id="workspace-add" type="button">Add workspace</button></div>
+              <div id="workspace-config-status" class="workspace-config-status" role="status"></div>
+              <div id="workspace-list" class="workspace-list"><div class="empty-state">Loading saved workspaces…</div></div>
+              <form id="workspace-form" class="workspace-form" hidden novalidate>
+                <input id="workspace-id" type="hidden">
+                <div class="workspace-form-heading"><strong id="workspace-form-title">Add workspace</strong><button id="workspace-use-current" type="button">Use current project</button></div>
+                <div class="workspace-form-grid">
+                  <label>Name<input id="workspace-name-input" type="text" autocomplete="off" maxlength="100" placeholder="Analytics project"></label>
+                  <label>Location<select id="workspace-kind"><option value="local">Local folder</option><option value="ssh">SSH remote host</option></select></label>
+                  <label class="workspace-ssh-field" hidden>SSH host<input id="workspace-host-input" type="text" autocomplete="off" spellcheck="false" placeholder="user@host or ~/.ssh/config alias"></label>
+                  <label class="workspace-ssh-field" hidden>SSH port<input id="workspace-port-input" type="text" inputmode="numeric" autocomplete="off" placeholder="22"></label>
+                  <label class="workspace-path-field"><i id="workspace-path-caption">Project directory</i><span><input id="workspace-path-input" type="text" autocomplete="off" spellcheck="false" placeholder="/absolute/path/to/seeknal-project"><button id="workspace-browse" type="button">Browse…</button></span></label>
+                </div>
+                <p class="workspace-ssh-field workspace-ssh-help" hidden>Studio connects with your SSH keys (BatchMode), installs its backend and the pinned Seeknal 2.14.0 runtime under ~/.cache/seeknal-studio on the host, and runs project work there. The host needs python3 and uv.</p>
+                <p id="workspace-form-error" class="workspace-form-error" role="alert"></p>
+                <div class="workspace-form-actions"><button id="workspace-cancel" type="button">Cancel</button><button id="workspace-save" type="submit">Save workspace</button></div>
+              </form>
+            </section>
+            <section class="configuration-card"><h2>Workspace</h2><dl><dt>Project</dt><dd id="settings-project">—</dd><dt>Path</dt><dd id="settings-path">—</dd><dt>Engine</dt><dd id="settings-engine">—</dd><dt>Agent</dt><dd id="settings-agent">—</dd><dt>Identity</dt><dd id="settings-agent-identity">—</dd><dt>Authority</dt><dd id="settings-agent-authority">—</dd></dl></section>
+            <section class="configuration-card agent-setup"><h2>Owned local agent</h2><p>The model may inspect this project and create drafts. Apply and execution remain explicit.</p><div class="agent-config-grid"><label>Provider<input id="agent-provider" value="openai" readonly></label><label>Model<input id="agent-model" value="deepseek-v4.1-flash:netra" readonly></label><label class="wide">API key file<input id="agent-key-path" value="~/sumopod-ai-api-key" autocomplete="off" spellcheck="false"></label></div><button id="agent-configure" class="agent-configure" type="button">Start and verify agent</button><small id="agent-config-status">Credentials stay in the backend and never enter page state.</small></section>
+            <section class="configuration-card environment-card"><div class="card-heading"><div><h2>Environment variables</h2><p id="environment-path">Loading project environment…</p></div><span id="environment-status">Not loaded</span></div><form id="environment-form"><div id="environment-entries" class="environment-entries"><div class="empty-state">Open Configuration to load environment metadata.</div></div><div class="environment-add"><input id="environment-new-key" type="text" autocomplete="off" spellcheck="false" placeholder="NEW_VARIABLE"><button id="environment-add" type="button">Add variable</button></div><div class="environment-actions"><small>Existing values are never returned to the browser. Leave a value blank to preserve it.</small><button id="environment-save" type="submit">Save environment</button></div></form></section>
+          </div>
+        </section>
+            </div>
+          </section>
+          <div id="editor-group-divider" class="editor-group-divider" role="separator" aria-label="Resize editor groups" aria-orientation="vertical" aria-valuemin="25" aria-valuemax="75" aria-valuenow="50" tabindex="0" hidden></div>
+          <section class="editor-group" data-group="right" aria-label="Right editor group" hidden>
+            <header class="editor-group-header">
+              <div class="editor-tabstrip" role="tablist" aria-label="Open views in right editor group"></div>
+              <div class="editor-group-actions">
+                <button type="button" data-group-action="move-left" title="Move active tab left" aria-label="Move active tab left">←</button>
+                <button type="button" data-group-action="move-right" title="Move active tab right" aria-label="Move active tab right">→</button>
+                <button type="button" data-group-action="split-right" title="Split editor right" aria-label="Split editor right">▥</button>
+                <button type="button" data-group-action="merge" title="Merge editor groups" aria-label="Merge editor groups">⊣</button>
+              </div>
+            </header>
+            <div class="editor-group-content"><div class="editor-group-empty">Open a view from the activity rail, or move a tab here.</div></div>
+          </section>
+        </div>
+      </main>
+
+      <aside id="agent-panel" class="agent-panel panel">
+        <div class="agent-header">
+          <div><h2>Build with Seeknal</h2><p id="agent-session-label">Pipeline copilot</p></div>
+          <span id="agent-badge" class="agent-badge disconnected"><i></i><span>Offline</span></span>
+        </div>
+        <div id="agent-feed" class="agent-feed" aria-live="polite">
+          <div class="agent-intro">
+            <div class="agent-mark"><svg viewBox="0 0 24 24"><path d="M12 3 14 9l6 2-6 2-2 6-2-6-6-2 6-2 2-6Z"/></svg></div>
+            <h3>Pipeline-aware assistance</h3>
+            <p id="agent-intro-copy">Checking the project-bound Seeknal agent…</p>
+          </div>
+        </div>
+        <div class="local-tools">
+          <span>Local tools</span>
+          <button id="review-drafts" type="button">Review drafts <i id="draft-count">0</i></button>
+          <button data-local-action="plan" type="button">Inspect plan</button>
+          <button data-local-action="validate" type="button">Validate project</button>
+        </div>
+        <form id="agent-form" class="agent-composer">
+          <textarea id="agent-input" rows="3" placeholder="Ask the agent to draft a pipeline change…" disabled></textarea>
+          <div class="composer-footer"><small id="agent-hint">Checking agent readiness</small><button id="agent-cancel" type="button" hidden aria-label="Cancel agent request"><svg viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="1"/></svg></button><button id="agent-send" type="submit" disabled aria-label="Send prompt"><svg viewBox="0 0 24 24"><path d="m4 4 17 8-17 8 4-8-4-8Z"/><path d="M8 12h13"/></svg></button></div>
+        </form>
+      </aside>
+    </div>
+
+    <footer class="statusbar">
+      <span><svg viewBox="0 0 24 24"><path d="M12 4c-4 0-4 3-4 5h7v2H7c-3 0-4 2-4 4s2 4 5 4h2v-3H8v-2h5c4 0 4-3 4-5s-1-5-5-5Z"/><circle cx="11" cy="6.5" r=".8"/><path d="M12 20c4 0 4-3 4-5H9v-2h8c3 0 4-2 4-4s-2-4-5-4h-2v3h2v2h-5c-4 0-4 3-4 5s1 5 5 5Z"/><circle cx="13" cy="17.5" r=".8"/></svg>Python</span>
+      <span><svg viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="7" ry="3"/><path d="M5 5v7c0 1.7 3.1 3 7 3s7-1.3 7-3V5M5 12v7c0 1.7 3.1 3 7 3s7-1.3 7-3v-7"/></svg>DuckDB</span>
+      <span><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="14" rx="2"/><path d="M9 22h6M12 18v4"/></svg><b id="footer-location">Local project</b></span>
+      <div class="status-spacer"></div>
+      <span id="status-message" role="status">Starting Seeknal Studio…</span>
+    </footer>
+    <dialog id="draft-dialog" class="settings-dialog draft-dialog">
+      <form method="dialog" class="settings-card" id="draft-review-form">
+        <div class="settings-title"><div><h2>Review agent drafts</h2><p>Validate and apply reviewed files explicitly</p></div><button class="quiet-icon" value="close" aria-label="Close draft review">×</button></div>
+        <div class="draft-review-body"><aside id="draft-list" class="draft-list"></aside><pre id="draft-diff" class="draft-diff">No draft selected.</pre></div>
+        <div class="draft-review-footer"><span id="draft-review-status">No changes awaiting review</span><button id="validate-draft" type="button" class="text-button" disabled>Validate draft</button><button id="apply-draft" type="button" class="settings-close" disabled>Apply changes</button></div>
+      </form>
+    </dialog>
+    <dialog id="history-dialog" class="settings-dialog history-dialog">
+      <form method="dialog" class="settings-card">
+        <div class="settings-title"><div><h2>Run history</h2><p>Jobs reported by this Studio process</p></div><button class="quiet-icon" value="close" aria-label="Close run history">×</button></div>
+        <div id="history-list" class="history-list"></div>
+        <button class="settings-close" value="close">Done</button>
+      </form>
+    </dialog>
+    <dialog id="workspace-switch-dialog" class="settings-dialog workspace-switch-dialog" aria-labelledby="workspace-switch-title" aria-describedby="workspace-switch-detail">
+      <form method="dialog" class="settings-card">
+        <div class="settings-title"><div><h2 id="workspace-switch-title">Switch workspace?</h2><p id="workspace-switch-target">The current project will close.</p></div><button id="workspace-switch-close" class="quiet-icon" value="cancel" aria-label="Cancel workspace switch">×</button></div>
+        <div class="workspace-switch-body"><p id="workspace-switch-detail">Unsaved values will be discarded only if you continue.</p><ul id="workspace-switch-warnings"></ul></div>
+        <div class="dialog-actions"><button id="workspace-switch-cancel" value="cancel" type="submit">Keep editing</button><button id="workspace-switch-confirm" class="settings-close" value="confirm" type="submit">Discard and switch</button></div>
+      </form>
+    </dialog>
+    <dialog id="project-dialog" class="settings-dialog project-dialog">
+      <form method="dialog" class="settings-card" id="project-form">
+        <div class="settings-title"><div><h2>Open Seeknal project</h2><p>Switch the native Studio runtime to a canonical local directory</p></div><button class="quiet-icon" value="close" aria-label="Close project picker">×</button></div>
+        <div class="project-picker-body"><label>Absolute project path<input id="project-path-input" type="text" autocomplete="off" spellcheck="false" placeholder="/absolute/path/to/seeknal-project"></label><button id="project-browse" type="button">Browse…</button><p id="project-switch-note">The current window restarts only after the launcher accepts the selected project.</p><div><strong>Recent projects</strong><div id="project-recent-list" class="project-recent-list"></div></div></div>
+        <div class="dialog-actions"><button value="close" type="submit">Cancel</button><button id="project-open" class="settings-close" type="button">Open project</button></div>
+      </form>
+    </dialog>
+    <dialog id="sql-ai-dialog" class="settings-dialog sql-ai-dialog">
+      <form method="dialog" class="settings-card" id="sql-ai-form">
+        <div class="settings-title"><div><h2>Draft SQL with AI</h2><p>Transform YAML only · creates a reviewable draft</p></div><button class="quiet-icon" value="close" aria-label="Close SQL drafting">×</button></div>
+        <div class="sql-ai-body"><label>What should the SQL do?<textarea id="sql-ai-request" rows="4" placeholder="For example: aggregate monthly revenue by customer and preserve null customers."></textarea></label><div class="context-preview"><strong>Context to send</strong><dl><dt>File</dt><dd id="sql-context-file">—</dd><dt>Transform</dt><dd id="sql-context-node">—</dd><dt>Inputs / schema</dt><dd id="sql-context-inputs">—</dd><dt>Buffer</dt><dd id="sql-context-buffer">—</dd></dl><p>No secrets or provider keys are included. Sending never saves, runs, validates, or applies a file.</p></div><p id="sql-ai-eligibility" class="eligibility-note"></p></div>
+        <div class="dialog-actions"><button value="close" type="submit">Cancel</button><button id="sql-ai-send" class="settings-close" type="button">Send and create draft</button></div>
+      </form>
+    </dialog>
+    <dialog id="new-draft-dialog" class="settings-dialog new-draft-dialog">
+      <form method="dialog" class="settings-card" id="new-draft-form">
+        <div class="settings-title"><div><h2>New Seeknal draft</h2><p>Generate a real CLI scaffold without applying it</p></div><button class="quiet-icon" value="close" aria-label="Close new draft">×</button></div>
+        <div class="new-draft-body">
+          <div class="new-draft-grid">
+            <label>Node type<select id="new-draft-type" required></select></label>
+            <label>Name<input id="new-draft-name" type="text" required autocomplete="off" spellcheck="false" placeholder="customer_orders"></label>
+            <label class="wide">Description<input id="new-draft-description" type="text" autocomplete="off" placeholder="Optional node description"></label>
+            <label class="format-toggle"><input id="new-draft-python" type="checkbox"><span>Generate Python</span></label>
+            <label>Python dependencies<input id="new-draft-deps" type="text" autocomplete="off" spellcheck="false" placeholder="pandas,requests" disabled></label>
+          </div>
+          <div class="command-preview"><strong>Command</strong><code id="new-draft-command">seeknal draft</code><p id="new-draft-note">Loading node types from this Seeknal runtime…</p></div>
+        </div>
+        <div class="dialog-actions"><button value="close" type="submit">Cancel</button><button id="new-draft-submit" class="settings-close" type="button" disabled>Create draft</button></div>
+      </form>
+    </dialog>
+  </div>
+  <script src="/app.js" defer></script>
+</body>
+</html>

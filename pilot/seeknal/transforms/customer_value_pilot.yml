@@ -1,0 +1,30 @@
+kind: transform
+name: customer_value_pilot
+description: "Paid-order lifetime value per customer, joining orders to the customer master"
+owner: "data-team@example.com"
+tags: ["studio-agent-pilot", "synthetic", "customer-value"]
+inputs:
+  - ref: source.orders
+  - ref: source.customers
+transform: |
+  SELECT
+    c.customer_id AS customer_id,
+    c.customer_name AS customer_name,
+    c.segment AS segment,
+    SUM(o.amount) AS lifetime_value,
+    COUNT(*) AS orders
+  FROM source.orders AS o
+  JOIN source.customers AS c
+    ON o.customer_id = c.customer_id
+  WHERE o.status = 'paid'
+  GROUP BY
+    c.customer_id,
+    c.customer_name,
+    c.segment
+output:
+  columns:
+    customer_id: "Customer identifier (join key from source.customers)"
+    customer_name: "Customer name from source.customers"
+    segment: "Customer segment from source.customers"
+    lifetime_value: "SUM of amount across the customer's paid orders"
+    orders: "COUNT(*) of paid orders for the customer"

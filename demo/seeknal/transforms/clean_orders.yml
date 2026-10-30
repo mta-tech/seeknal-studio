@@ -1,0 +1,18 @@
+kind: transform
+name: clean_orders
+description: Paid orders enriched with customer attributes
+transform: |
+  SELECT
+    o.order_id,
+    o.customer_id,
+    c.customer_name,
+    c.segment,
+    o.amount,
+    CAST(o.ordered_at AS DATE) AS ordered_at
+  FROM source.orders AS o
+  JOIN source.customers AS c USING (customer_id)
+  WHERE o.status = 'paid'
+inputs:
+  - ref: source.orders
+  - ref: source.customers
+tags: [commerce, studio-demo]

@@ -1,0 +1,15 @@
+kind: transform
+name: customer_ltv
+description: Customer lifetime value and order count
+transform: |
+  SELECT
+    customer_id,
+    MAX(customer_name) AS customer_name,
+    MAX(segment) AS segment,
+    SUM(amount) AS lifetime_value,
+    COUNT(*) AS orders
+  FROM transform.clean_orders
+  GROUP BY customer_id
+inputs:
+  - ref: transform.clean_orders
+tags: [commerce, studio-demo]

@@ -1,0 +1,3 @@
+# Seeknal Studio managed SDK runtime. Keep the Studio runtime separate from the
+# editable Signal checkout used during development.
+seeknal==2.14.0

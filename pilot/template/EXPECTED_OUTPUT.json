@@ -1,0 +1,9 @@
+{
+  "description": "Expected paid-order totals computed independently from the synthetic input CSVs",
+  "node": "transform.customer_value_pilot",
+  "rows": [
+    {"customer_id": "C001", "customer_name": "Ayu", "segment": "Retail", "lifetime_value": 340000, "orders": 2},
+    {"customer_id": "C002", "customer_name": "Bima", "segment": "SMB", "lifetime_value": 1215000, "orders": 2},
+    {"customer_id": "C003", "customer_name": "Citra", "segment": "Enterprise", "lifetime_value": 2320000, "orders": 1}
+  ]
+}

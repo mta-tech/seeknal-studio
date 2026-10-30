@@ -1,0 +1,14 @@
+kind: transform
+name: revenue_daily
+description: Daily commerce revenue
+transform: |
+  SELECT
+    ordered_at,
+    SUM(amount) AS revenue,
+    COUNT(*) AS orders
+  FROM transform.clean_orders
+  GROUP BY ordered_at
+  ORDER BY ordered_at
+inputs:
+  - ref: transform.clean_orders
+tags: [commerce, studio-demo]

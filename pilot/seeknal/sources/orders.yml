@@ -1,0 +1,17 @@
+kind: source
+name: orders
+description: Synthetic commerce orders for the isolated Studio agent pilot
+source: csv
+table: data/orders.csv
+columns:
+  order_id:
+    dtype: string
+  customer_id:
+    dtype: string
+  amount:
+    dtype: integer
+  status:
+    dtype: string
+  ordered_at:
+    dtype: date
+tags: [studio-agent-pilot, synthetic]

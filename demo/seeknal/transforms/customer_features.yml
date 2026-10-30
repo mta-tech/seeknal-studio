@@ -1,0 +1,16 @@
+kind: transform
+name: customer_features
+description: Customer value features for downstream models
+transform: |
+  SELECT
+    customer_id,
+    lifetime_value,
+    orders,
+    CASE
+      WHEN lifetime_value >= 1000000 THEN 'high_value'
+      ELSE 'standard'
+    END AS value_segment
+  FROM transform.customer_ltv
+inputs:
+  - ref: transform.customer_ltv
+tags: [commerce, studio-demo, features]
