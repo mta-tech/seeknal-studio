@@ -1429,11 +1429,20 @@ async function finishAgentSession(session) {
   renderAgentStatus();
 }
 
-async function pollAgentSession(request, sessionId, turnId) {
+// A dropped connection or a 5xx from the backend (or the SSH gateway) is retried
+// with backoff before the turn is reported as lost; anything else fails at once.
+const AGENT_POLL_RETRIES = 6;
+const AGENT_POLL_TIMEOUT_MS = 20000;
+function isTransientPollError(error) {
+  if (error.status) return error.status >= 500 || error.status === 408 || error.status === 429;
+  return error instanceof TypeError || error.name === "TimeoutError";
+}
+
+async function pollAgentSession(request, sessionId, turnId, failures = 0) {
   if (request !== state.agent.request || state.agent.cancelled || state.agent.cancelPending) return;
   try {
     const session = requireAgentTurn(
-      await api(`/api/agent/sessions/${encodeURIComponent(sessionId)}?turn_id=${encodeURIComponent(turnId)}`),
+      await api(`/api/agent/sessions/${encodeURIComponent(sessionId)}?turn_id=${encodeURIComponent(turnId)}`, { signal: AbortSignal.timeout(AGENT_POLL_TIMEOUT_MS) }),
       turnId,
     );
     if (request !== state.agent.request || state.agent.cancelled || state.agent.cancelPending) return;
@@ -1449,7 +1458,14 @@ async function pollAgentSession(request, sessionId, turnId) {
     }
     await finishAgentSession(session);
   } catch (error) {
-    if (request !== state.agent.request || state.agent.cancelled) return;
+    // A pending cancel owns the turn now: it resumes polling itself if the cancel fails.
+    if (request !== state.agent.request || state.agent.cancelled || state.agent.cancelPending) return;
+    if (failures < AGENT_POLL_RETRIES && isTransientPollError(error)) {
+      renderAgentTurnStatus(turnId, "Connection lost · retrying…");
+      state.agent.pollTimer = setTimeout(() => pollAgentSession(request, sessionId, turnId, failures + 1), Math.min(500 * 2 ** failures, 8000));
+      return;
+    }
+    renderAgentTurnStatus(turnId, "Connection lost");
     state.agent.busy = false;
     state.agent.activeTurnId = null;
     appendAgentMessage("agent", error.message, "error");

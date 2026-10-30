@@ -462,7 +462,17 @@ def draft_options() -> dict:
 
 def validate_draft_request(data: dict) -> dict:
     metadata = draft_options()
+    # Each kind is listed once, but older callers may still send the
+    # underscore spelling (feature_group); resolve it to the listed value.
+    # An alias is honoured only if it names exactly one listed kind and is
+    # never the spelling of an excluded kind.
     by_value = {entry["value"]: entry for entry in metadata["node_types"]}
+    excluded = {entry["value"] for entry in metadata["excluded_node_types"]}
+    aliases: dict[str, list[dict]] = {}
+    for entry in metadata["node_types"]:
+        for alias in {entry["normalized"], entry["normalized"].replace("_", "-")} - by_value.keys() - excluded:
+            aliases.setdefault(alias, []).append(entry)
+    by_value.update({alias: entries[0] for alias, entries in aliases.items() if len(entries) == 1})
     node_type = data.get("node_type")
     name = data.get("name")
     description = data.get("description")
@@ -485,6 +495,7 @@ def validate_draft_request(data: dict) -> dict:
     ):
         raise ValueError("draft deps are invalid or too long")
     option = by_value[node_type]
+    node_type = option["value"]
     if python and not option["python_supported"]:
         raise ValueError(f"Python drafts are not supported for {node_type}")
     if deps and not python:

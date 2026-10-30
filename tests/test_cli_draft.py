@@ -104,6 +104,43 @@ class CliDraftTests(unittest.TestCase):
         self.assertIn("common-source", excluded)
         self.assertIn("managed target", excluded["common-source"]["reason"])
 
+    def test_underscore_spellings_resolve_to_the_listed_value(self):
+        for sent, expected in (
+            ("feature_group", "feature-group"),
+            ("semantic_model", "semantic-model"),
+            ("second_order_aggregation", "second-order-aggregation"),
+            ("feature-group", "feature-group"),
+        ):
+            with self.subTest(sent=sent):
+                request = self.server.validate_draft_request({"node_type": sent, "name": "safe"})
+                self.assertEqual(expected, request["node_type"])
+        for rejected in ("common_source", "common-source", "feature group", "FEATURE_GROUP"):
+            with self.subTest(rejected=rejected), self.assertRaises(ValueError):
+                self.server.validate_draft_request({"node_type": rejected, "name": "safe"})
+
+    def test_ambiguous_or_excluded_aliases_are_not_resolved(self):
+        metadata = {
+            "node_types": [
+                {"value": "alpha-beta", "normalized": "alpha_beta", "python_supported": False},
+                {"value": "alpha_beta_x", "normalized": "alpha_beta", "python_supported": False},
+                {"value": "gamma", "normalized": "gamma_delta", "python_supported": False},
+            ],
+            "excluded_node_types": [
+                {"value": "gamma-delta", "normalized": "other", "python_supported": False, "reason": "x"},
+            ],
+        }
+        with patch.object(self.server, "draft_options", return_value=metadata):
+            for listed in ("alpha-beta", "alpha_beta_x", "gamma"):
+                with self.subTest(listed=listed):
+                    request = self.server.validate_draft_request({"node_type": listed, "name": "safe"})
+                    self.assertEqual(listed, request["node_type"])
+            # alpha_beta names two kinds; gamma-delta is an excluded kind's spelling.
+            for rejected in ("alpha_beta", "gamma-delta"):
+                with self.subTest(rejected=rejected), self.assertRaises(ValueError):
+                    self.server.validate_draft_request({"node_type": rejected, "name": "safe"})
+            request = self.server.validate_draft_request({"node_type": "gamma_delta", "name": "safe"})
+            self.assertEqual("gamma", request["node_type"])
+
     def test_successful_options_are_cached_but_failures_retry(self):
         metadata = {
             "node_types": [{
