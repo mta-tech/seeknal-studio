@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -178,7 +179,7 @@ class BackendUnitTests(unittest.TestCase):
         original_seeknal = self.server.SEEKNAL
         original_commands = self.server.COMMANDS
         try:
-            fingerprint = self.server.project_fingerprint()
+            fingerprint = self.server.freshness_fingerprint()
             self.server.save_successful_fingerprint(fingerprint)
             store = self.server.JobStore()
             self.server.SEEKNAL = Path(sys.executable)
@@ -209,7 +210,7 @@ class BackendHTTPTests(unittest.TestCase):
         cls.old_project = os.environ.get("SEEKNAL_STUDIO_PROJECT")
         os.environ["SEEKNAL_STUDIO_PROJECT"] = str(cls.project)
         cls.server = load_server()
-        cls.server.JOBS.last_successful_fingerprint = cls.server.project_fingerprint()
+        cls.server.JOBS.last_successful_fingerprint = cls.server.freshness_fingerprint()
         cls.httpd = cls.server.ThreadingHTTPServer(("127.0.0.1", 0), cls.server.Handler)
         cls.port = cls.httpd.server_address[1]
         cls.server.HOSTS = {f"127.0.0.1:{cls.port}"}
@@ -288,26 +289,105 @@ class BackendHTTPTests(unittest.TestCase):
         self.server.JOBS.execution_lock.acquire()
         try:
             status, result = self.request(
-                "/api/file", method="POST", payload={"path": path, "content": current["content"]}
+                "/api/file", method="POST",
+                payload={"path": path, "content": current["content"], "base_hash": current["content_hash"]},
             )
             self.assertEqual(409, status)
             self.assertIn("running", result["error"])
         finally:
             self.server.JOBS.execution_lock.release()
 
+    def test_save_refuses_to_overwrite_a_file_changed_since_it_was_opened(self):
+        path = "seeknal/transforms/customer_ltv.yml"
+        target = self.project / path
+        _, opened = self.request(f"/api/file?path={path}")
+        original = target.read_bytes()
+        mode = 0o640
+        os.chmod(target, mode)
+        try:
+            # Someone else saves first.
+            target.write_text(opened["content"] + "# teammate edit\n")
+            status, result = self.request("/api/file", method="POST", payload={
+                "path": path, "content": opened["content"] + "# my edit\n", "base_hash": opened["content_hash"],
+            })
+            self.assertEqual(409, status)
+            self.assertEqual("editor_conflict", result["error_code"])
+            self.assertIn("teammate edit", target.read_text())
+            for payload in ({"path": path, "content": "x"}, {"path": path, "content": "x", "base_hash": "nothex"}):
+                with self.subTest(payload=payload):
+                    status, _ = self.request("/api/file", method="POST", payload=payload)
+                    self.assertEqual(400, status)
+                    self.assertIn("teammate edit", target.read_text())
+            # Saving against the current version works and keeps the permissions.
+            _, current = self.request(f"/api/file?path={path}")
+            status, result = self.request("/api/file", method="POST", payload={
+                "path": path, "content": current["content"] + "# my edit\n", "base_hash": current["content_hash"],
+            })
+            self.assertEqual(200, status)
+            self.assertEqual(mode, target.stat().st_mode & 0o777)
+            self.assertEqual(hashlib.sha256(target.read_bytes()).hexdigest(), result["content_hash"])
+            self.assertEqual([], list(target.parent.glob("*.studio.tmp")))
+        finally:
+            target.write_bytes(original)
+
+    def test_crlf_file_hash_matches_the_bytes_served(self):
+        target = self.project / "seeknal" / "pipelines" / "crlf_helper.py"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"x = 1\r\ny = 2\r\n")
+        self.addCleanup(target.unlink, missing_ok=True)
+        path = target.relative_to(self.project).as_posix()
+        status, opened = self.request(f"/api/file?path={path}")
+        self.assertEqual(200, status)
+        self.assertEqual("x = 1\ny = 2\n", opened["content"])
+        self.assertEqual(hashlib.sha256(target.read_bytes()).hexdigest(), opened["content_hash"])
+        status, saved = self.request("/api/file", method="POST", payload={
+            "path": path, "content": "x = 3\n", "base_hash": opened["content_hash"],
+        })
+        self.assertEqual(200, status)
+        self.assertEqual(hashlib.sha256(b"x = 3\n").hexdigest(), saved["content_hash"])
+        self.assertEqual(b"x = 3\n", target.read_bytes())
+
+    def test_a_run_by_someone_else_marks_outputs_stale(self):
+        state = self.project / "target" / "run_state.json"
+        original = state.read_bytes() if state.is_file() else None
+        saved = self.server.JOBS.last_successful_fingerprint
+        status, graph = self.request("/api/graph")
+        self.assertEqual(200, status)
+        self.assertTrue(graph["fresh"])
+        try:
+            # A teammate's terminal run (or another Studio) rewrites the run state.
+            state.parent.mkdir(parents=True, exist_ok=True)
+            state.write_text(json.dumps({"run_id": "someone-else"}))
+            status, graph = self.request("/api/graph")
+            self.assertFalse(graph["fresh"])
+        finally:
+            if original is None:
+                state.unlink(missing_ok=True)
+            else:
+                state.write_bytes(original)
+            self.server.JOBS.last_successful_fingerprint = saved
+        status, graph = self.request("/api/graph")
+        self.assertTrue(graph["fresh"])
+
     def test_save_marks_preview_stale_without_losing_file(self):
         path = "seeknal/transforms/customer_ltv.yml"
         status, current = self.request(f"/api/file?path={path}")
         self.assertEqual(200, status)
         try:
-            status, result = self.request("/api/file", method="POST", payload={"path": path, "content": current["content"] + "\n"})
+            status, result = self.request("/api/file", method="POST", payload={
+                "path": path, "content": current["content"] + "\n", "base_hash": current["content_hash"],
+            })
             self.assertEqual(200, status)
             self.assertFalse(result["preview_fresh"])
+            saved_hash = result["content_hash"]
             status, result = self.request("/api/preview?node=transform.customer_ltv")
             self.assertEqual(409, status)
             self.assertEqual([], result["rows"])
         finally:
-            self.request("/api/file", method="POST", payload={"path": path, "content": current["content"]})
+            status, _ = self.request("/api/file", method="POST", payload={
+                "path": path, "content": current["content"], "base_hash": saved_hash,
+            })
+            self.assertEqual(200, status)
         status, result = self.request("/api/preview?node=transform.customer_ltv")
         self.assertEqual(200, status)
         self.assertTrue(result["fresh"])

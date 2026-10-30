@@ -122,21 +122,48 @@ def _read_token() -> str:
     return data.decode(errors="replace").strip()
 
 
+BUSY_MARKER = "SEEKNAL_STUDIO_BUSY "
+
+
+def _lock_holder(path: Path) -> dict:
+    try:
+        holder = json.loads(path.read_text() or "{}")
+    except (OSError, ValueError):
+        return {}
+    return {key: holder[key] for key in ("client", "started_at") if isinstance(holder.get(key), str)}
+
+
 def _project_lock(project: str, deadline: float):
-    """Hold one backend per project; a stale session exits within the heartbeat timeout."""
+    """Hold one backend per project; a stale session exits within the heartbeat timeout.
+
+    The holder records where it was opened from, so a second laptop is told who has
+    the project instead of only that it is busy."""
 
     locks = CACHE / "locks"
     locks.mkdir(parents=True, exist_ok=True, mode=0o700)
     name = hashlib.sha256(os.path.realpath(os.path.expanduser(project)).encode()).hexdigest()[:24]
-    guard = open(locks / f"{name}.lock", "w")
+    path = locks / f"{name}.lock"
+    # Append mode: opening must not wipe the current holder's record.
+    guard = open(path, "a+")
+    announced = False
     while True:
         try:
             fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return guard
+            guard.seek(0)
+            guard.truncate()
+            guard.write(json.dumps({
+                "client": (os.environ.get("SSH_CLIENT") or "").split(" ")[0] or "this host",
+                "started_at": time.strftime("%Y-%m-%d %H:%M %Z"),
+            }))
+            guard.flush()
+            return guard, {}
         except BlockingIOError:
+            if not announced:
+                print(BUSY_MARKER + json.dumps(_lock_holder(path)), flush=True)
+                announced = True
             if time.monotonic() > deadline:
                 guard.close()
-                return None
+                return None, _lock_holder(path)
             time.sleep(0.5)
 
 
@@ -145,9 +172,9 @@ def serve(project: str, runtime_python: str) -> int:
     if len(token) < 32:
         print("missing session token", file=sys.stderr)
         return 2
-    guard = _project_lock(project, time.monotonic() + HEARTBEAT_TIMEOUT + 15)
+    guard, holder = _project_lock(project, time.monotonic() + HEARTBEAT_TIMEOUT + 15)
     if guard is None:
-        print("another Studio backend still holds this remote project", file=sys.stderr)
+        print("another Studio backend still holds this remote project", holder, file=sys.stderr)
         return 5
     logs = CACHE / "logs"
     logs.mkdir(parents=True, exist_ok=True, mode=0o700)

@@ -47,6 +47,26 @@ class EngineBridgePathSafetyTests(unittest.TestCase):
     def tearDown(self):
         self.temporary.cleanup()
 
+    def test_applied_file_is_not_left_private_to_the_applier(self):
+        drafts = self.project / ".seeknal" / "drafts"
+        draft = drafts / "draft_transform_shared.yml"
+        draft.write_text("kind: transform\nname: shared\ntransform: SELECT 1\n")
+        os.chmod(draft, 0o600)
+        relative = draft.relative_to(self.project).as_posix()
+        source_hash = self.engine._hash(draft)
+        result = self.engine.apply_draft(self.project, relative, source_hash, None)
+        target = self.project / result["destination"]
+        umask = os.umask(0)
+        os.umask(umask)
+        self.assertEqual(0o666 & ~umask, target.stat().st_mode & 0o777)
+        # Replacing an existing file keeps that file's permissions.
+        os.chmod(target, 0o640)
+        draft.write_text("kind: transform\nname: shared\ntransform: SELECT 2\n")
+        os.chmod(draft, 0o600)
+        self.engine.apply_draft(self.project, relative, self.engine._hash(draft), self.engine._hash(target))
+        self.assertEqual(0o640, target.stat().st_mode & 0o777)
+        self.assertIn("SELECT 2", target.read_text())
+
     def test_draft_details_rejects_lexical_draft_symlink(self):
         real = self.project / ".seeknal" / "drafts" / "real.yml"
         real.write_text("kind: transform\nname: real\ntransform: SELECT 1\n")

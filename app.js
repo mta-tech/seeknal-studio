@@ -145,6 +145,7 @@ const state = {
   selectedFile: null,
   selectedNode: null,
   originalContent: "",
+  originalHash: null,
   dirty: false,
   jobs: [],
   activeJob: null,
@@ -682,6 +683,7 @@ async function openFile(path, { guard = true } = {}) {
     if (request !== state.fileRequest) return;
     state.selectedFile = payload.path || path;
     state.originalContent = String(payload.content || "");
+    state.originalHash = payload.content_hash || null;
     state.dirty = false;
     const editor = $("#code-editor");
     editor.disabled = false;
@@ -777,8 +779,9 @@ async function saveCurrentFile() {
     $("#save-button").disabled = true;
     $("#save-status").textContent = "Saving…";
     const content = $("#code-editor").value;
-    await api("/api/file", { method: "POST", body: { path: state.selectedFile, content } });
+    const saved = await api("/api/file", { method: "POST", body: { path: state.selectedFile, content, base_hash: state.originalHash } });
     state.originalContent = content;
+    state.originalHash = saved.content_hash || null;
     state.dirty = false;
     state.editorFlow = { ...state.editorFlow, phase: "saved", approval: null, buffer: content };
     $("#save-status").textContent = "Saved";
@@ -793,7 +796,7 @@ async function saveCurrentFile() {
     }
   } catch (error) {
     $("#save-button").disabled = false;
-    $("#save-status").textContent = "Save failed";
+    $("#save-status").textContent = error.payload?.error_code === "editor_conflict" ? "Changed on disk · not saved" : "Save failed";
     showError(error);
   }
 }

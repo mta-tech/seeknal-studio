@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
+import stat
 import sys
 import hashlib
 from pathlib import Path
@@ -372,8 +374,19 @@ def apply_draft(
         or _canonical_project_path(project, target_lexical, "draft destination became unsafe") != target
     ):
         raise ValueError("draft source or destination changed after review")
+    # Drafts are private (0600) while under review; the applied pipeline file must
+    # stay readable to everyone the project is shared with, so it keeps the mode of
+    # the file it replaces, or gets the normal mode for a new file.
+    mode = stat.S_IMODE(target.stat().st_mode) if target.is_file() else _new_file_mode()
     shutil.move(str(source), str(target))
+    os.chmod(target, mode)
     return {**details, "applied": True}
+
+
+def _new_file_mode() -> int:
+    umask = os.umask(0)
+    os.umask(umask)
+    return 0o666 & ~umask
 
 
 def main() -> None:

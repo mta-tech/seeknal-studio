@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import stat
 import subprocess
 import threading
 import time
@@ -340,6 +341,24 @@ def project_fingerprint() -> str:
     return digest.hexdigest()
 
 
+def output_signature() -> str:
+    """Hash Seeknal's run state files, which every run rewrites, including runs
+    started by someone else (another Studio, a terminal, a scheduler)."""
+    digest = hashlib.sha256()
+    target = PROJECT / "target"
+    states = [target / "run_state.json", *target.glob("environments/*/run_state.json")]
+    for path in sorted(path for path in states if path.is_file() and not path.is_symlink()):
+        digest.update(path.relative_to(PROJECT).as_posix().encode() + b"\0")
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def freshness_fingerprint(sources: str | None = None) -> str:
+    # Outputs are fresh only for the sources of the last successful Studio run
+    # and only while nobody has run anything since.
+    return f"{sources or project_fingerprint()}:{output_signature()}"
+
+
 STUDIO_STATE = PROJECT / "target" / "studio_state.json"
 
 
@@ -549,7 +568,7 @@ class JobStore:
         if STUDIO_STATE.is_file() and not STUDIO_STATE.is_symlink():
             try:
                 saved = json.loads(STUDIO_STATE.read_text()).get("project_fingerprint")
-                if saved == project_fingerprint():
+                if saved == freshness_fingerprint():
                     self.last_successful_fingerprint = saved
             except (json.JSONDecodeError, OSError):
                 pass
@@ -791,8 +810,9 @@ class JobStore:
                         if validation_error is not None:
                             self.jobs[job_id]["validation_error"] = validation_error
                     if full_run_success and not cancelled:
-                        save_successful_fingerprint(end_fingerprint)
-                        self.last_successful_fingerprint = end_fingerprint
+                        successful = freshness_fingerprint(end_fingerprint)
+                        save_successful_fingerprint(successful)
+                        self.last_successful_fingerprint = successful
                     elif action == "run":
                         self.last_successful_fingerprint = None
                     if action == "validate-draft" and effective_returncode == 0 and not cancelled:
@@ -1341,14 +1361,20 @@ class Handler(SimpleHTTPRequestHandler):
             elif parsed.path == "/api/file":
                 values = parse_qs(parsed.query)
                 target = safe_file(values.get("path", [None])[0])
-                self.send_json({
-                    "path": values.get("path", [None])[0],
-                    "content": target.read_text(encoding="utf-8"),
-                    "content_hash": file_hash(target),
-                }) if target else self.send_json({"error": "file not found"}, 404)
+                if target is None:
+                    self.send_json({"error": "file not found"}, 404)
+                else:
+                    # One read: the hash must describe exactly the content served,
+                    # or a teammate's save in between would be overwritten later.
+                    raw = target.read_bytes()
+                    self.send_json({
+                        "path": values.get("path", [None])[0],
+                        "content": raw.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n"),
+                        "content_hash": hashlib.sha256(raw).hexdigest(),
+                    })
             elif parsed.path == "/api/graph":
                 result = bridge("graph")
-                fresh = JOBS.last_successful_fingerprint == project_fingerprint()
+                fresh = JOBS.last_successful_fingerprint == freshness_fingerprint()
                 result["fresh"] = fresh
                 if not fresh:
                     for node in result["nodes"]:
@@ -1358,7 +1384,7 @@ class Handler(SimpleHTTPRequestHandler):
             elif parsed.path == "/api/preview":
                 node = parse_qs(parsed.query).get("node", [""])[0]
                 result = bridge("preview", node)
-                fresh = JOBS.last_successful_fingerprint == project_fingerprint()
+                fresh = JOBS.last_successful_fingerprint == freshness_fingerprint()
                 result.update(fresh=fresh, freshness="current" if fresh else "stale")
                 if fresh:
                     self.send_json(result)
@@ -1438,21 +1464,42 @@ class Handler(SimpleHTTPRequestHandler):
             if self.path == "/api/file":
                 target = safe_file(data.get("path"))
                 content = data.get("content")
+                base_hash = data.get("base_hash")
                 if target is None or not isinstance(content, str):
                     raise ValueError("invalid editable file")
+                if not isinstance(base_hash, str) or re.fullmatch(r"[0-9a-f]{64}", base_hash) is None:
+                    raise ValueError("base_hash of the file as it was opened is required")
                 if not JOBS.execution_lock.acquire(blocking=False):
                     busy = "An agent turn is running (it may be waiting for your answer)" if AGENT.busy() \
                         else "A pipeline job is running"
                     self.send_json({"error": f"{busy}; save after it finishes"}, 409)
                     return
                 try:
-                    temporary = target.with_suffix(target.suffix + ".studio.tmp")
-                    temporary.write_text(content)
-                    os.replace(temporary, target)
+                    # Someone else (another Studio, a terminal, git) may have
+                    # changed the file since it was opened: never overwrite that.
+                    if file_hash(target) != base_hash:
+                        raise EditorConflictError(
+                            "File changed on disk since you opened it, so your edits were not saved. "
+                            "They are still in the editor: copy them, close and reopen the file, then reapply them."
+                        )
+                    # A per-save temp name keeps concurrent backends from
+                    # interleaving writes; the file keeps its permissions.
+                    temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.studio.tmp")
+                    try:
+                        with temporary.open("x", encoding="utf-8") as handle:
+                            handle.write(content)
+                        os.chmod(temporary, stat.S_IMODE(target.stat().st_mode))
+                        os.replace(temporary, target)
+                    finally:
+                        temporary.unlink(missing_ok=True)
+                    saved_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
                 finally:
                     JOBS.execution_lock.release()
-                fresh = JOBS.last_successful_fingerprint == project_fingerprint()
-                self.send_json({"saved": True, "path": data["path"], "bytes": len(content.encode()), "preview_fresh": fresh})
+                fresh = JOBS.last_successful_fingerprint == freshness_fingerprint()
+                self.send_json({
+                    "saved": True, "path": data["path"], "bytes": len(content.encode()),
+                    "content_hash": saved_hash, "preview_fresh": fresh,
+                })
             elif self.path == "/api/editor/prepare":
                 if not JOBS.execution_lock.acquire(blocking=False):
                     self.send_json({"error": "Active work must finish before preparing editor changes"}, 409)

@@ -424,6 +424,79 @@ class InstallLoaderTests(unittest.TestCase):
                 self.assertEqual(sorted(SERVER_FILES), sorted(p.name for p in target.iterdir() if p.name != ".complete"))
 
 
+class ProjectLockTests(unittest.TestCase):
+    def test_second_session_learns_who_holds_the_project(self):
+        holder_script = (
+            "import sys, time; sys.path.insert(0, sys.argv[1]); import remote_host;"
+            "guard, _ = remote_host._project_lock(sys.argv[2], time.monotonic() + 5);"
+            "print('held' if guard else 'missed', flush=True); time.sleep(30)"
+        )
+        waiter_script = (
+            "import json, sys, time; sys.path.insert(0, sys.argv[1]); import remote_host;"
+            "guard, holder = remote_host._project_lock(sys.argv[2], time.monotonic() + 1);"
+            "print('RESULT ' + json.dumps({'acquired': guard is not None, 'holder': holder}), flush=True)"
+        )
+        with tempfile.TemporaryDirectory() as home:
+            project = str(Path(home) / "project")
+            base = {"HOME": home, "PATH": os.environ.get("PATH", "")}
+            holder = subprocess.Popen(
+                [str(PYTHON), "-c", holder_script, str(ROOT), project],
+                env={**base, "SSH_CLIENT": "10.0.0.7 51234 22"}, stdout=subprocess.PIPE, text=True,
+            )
+            try:
+                self.assertEqual("held", holder.stdout.readline().strip())
+                waiter = subprocess.run(
+                    [str(PYTHON), "-c", waiter_script, str(ROOT), project],
+                    env={**base, "SSH_CLIENT": "10.0.0.9 40000 22"}, capture_output=True, text=True, timeout=30,
+                )
+            finally:
+                holder.kill()
+                holder.wait()
+        lines = waiter.stdout.splitlines()
+        busy = [line for line in lines if line.startswith("SEEKNAL_STUDIO_BUSY ")]
+        self.assertEqual(1, len(busy), waiter.stdout)
+        self.assertEqual("10.0.0.7", json.loads(busy[0].split(" ", 1)[1])["client"])
+        result = json.loads(next(line for line in lines if line.startswith("RESULT ")).split(" ", 1)[1])
+        self.assertFalse(result["acquired"])
+        self.assertEqual("10.0.0.7", result["holder"]["client"])
+        self.assertIn("started_at", result["holder"])
+
+    def test_busy_project_error_names_the_holder(self):
+        import remote_workspace
+        from unittest import mock
+        busy = "SEEKNAL_STUDIO_BUSY " + json.dumps({"client": "10.0.0.7", "started_at": "2026-10-30 09:00 UTC"})
+        fake_host = f"import sys; sys.stdin.readline(); print({busy!r}, flush=True); sys.exit(5)"
+        with tempfile.TemporaryDirectory() as name:
+            log = open(Path(name) / "service.log", "w+")
+            self.addCleanup(log.close)
+            session = remote_workspace.RemoteSession(
+                RemoteTarget("fitra@example.invalid", "/srv/project", None, None, None), log=log, socket_dir=Path(name),
+            )
+            self.addCleanup(session._stopping.set)
+            with mock.patch.object(remote_workspace, "ssh_command", lambda *_args: [str(PYTHON), "-c", fake_host]):
+                with self.assertRaisesRegex(RuntimeError, "already has this remote project open") as raised:
+                    session._serve("/tmp/unused", "/usr/bin/python3")
+            self.assertIn("opened from 10.0.0.7, since 2026-10-30 09:00 UTC", str(raised.exception))
+            session._host.stdin.close()
+            session._host.stdout.close()
+            log.seek(0)
+            self.assertIn("waiting for it to close", log.read())
+
+    def test_client_reports_the_busy_holder_while_waiting(self):
+        from remote_workspace import RemoteSession, _describe_holder
+        stream = io.BytesIO(
+            b"motd noise\n"
+            b'SEEKNAL_STUDIO_BUSY {"client": "10.0.0.7", "started_at": "2026-10-30 09:00 UTC"}\n'
+            b'SEEKNAL_STUDIO_READY {"port": 1}\n'
+        )
+        seen = []
+        line = RemoteSession._ready_line(stream, 5, seen.append)
+        self.assertTrue(line.startswith(b"SEEKNAL_STUDIO_READY"))
+        self.assertEqual([{"client": "10.0.0.7", "started_at": "2026-10-30 09:00 UTC"}], seen)
+        self.assertEqual("opened from 10.0.0.7, since 2026-10-30 09:00 UTC", _describe_holder(seen[0]))
+        self.assertEqual("details unavailable", _describe_holder({"client": 5}))
+
+
 class ServerTokenTests(unittest.TestCase):
     def test_server_requires_access_token_when_configured(self):
         token = "s" * 43

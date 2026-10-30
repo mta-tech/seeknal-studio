@@ -128,10 +128,23 @@ async def draft_node(
         )
         with context.fs_lock:
             _atomic_draft_write(drafts, filename, content, replace=False)
+            _AGENT_DRAFTS[(_ACTIVE_SESSION, filename)] = _content_hash(content)
         context.artifact_discovery.refresh()
         return f"Created draft for Studio review: .seeknal/drafts/{filename}\n\n{content}"
     except Exception as error:
         return f"Failed to create draft: {_redact(error)}"
+
+
+# Drafts each conversation created or wrote, with the hash of what it wrote. The
+# agent may only overwrite those, and only while nobody else has changed them: a
+# draft made by a teammate, by Studio, by another conversation, or edited since
+# (including in Studio's editor) must never be silently replaced.
+_AGENT_DRAFTS: dict[tuple[str | None, str], str] = {}
+_ACTIVE_SESSION: str | None = None
+
+
+def _content_hash(content: str | bytes) -> str:
+    return hashlib.sha256(content.encode() if isinstance(content, str) else content).hexdigest()
 
 
 def _atomic_draft_write(drafts: Path, file_name: str, content: str, *, replace: bool) -> None:
@@ -161,7 +174,9 @@ def _atomic_draft_write(drafts: Path, file_name: str, content: str, *, replace: 
 
 
 def write_draft(file_name: str, content: str) -> str:
-    """Write complete YAML/Python content to an existing or new draft file."""
+    """Write complete YAML/Python content to a new draft file, or to a draft this
+    conversation created that nobody has changed since. Other existing drafts are
+    never overwritten: write to a new draft name instead."""
     from seeknal.ask.agents.tools._context import get_tool_context
 
     if not isinstance(file_name, str) or not _DRAFT_NAME.fullmatch(Path(file_name).name):
@@ -180,11 +195,39 @@ def write_draft(file_name: str, content: str) -> str:
         return "Draft path is unsafe."
     try:
         with context.fs_lock:
-            _atomic_draft_write(drafts, file_name, content, replace=True)
+            existing = target.exists()
+            if existing:
+                written = _AGENT_DRAFTS.get((_ACTIVE_SESSION, file_name))
+                if written is None:
+                    return (
+                        f"Draft {file_name} already exists and was not created in this conversation, "
+                        "so it was not overwritten. Write your version to a new draft name "
+                        f"(for example {_alternative_name(file_name)})."
+                    )
+                if not target.is_file() or _content_hash(target.read_bytes()) != written:
+                    return (
+                        f"Draft {file_name} was changed since you wrote it (by a person or another tool), "
+                        "so it was not overwritten. Write your version to a new draft name "
+                        f"(for example {_alternative_name(file_name)})."
+                    )
+            # A new draft is linked into place, which fails if someone else
+            # created the same name in the meantime instead of replacing it.
+            _atomic_draft_write(drafts, file_name, content, replace=existing)
+            _AGENT_DRAFTS[(_ACTIVE_SESSION, file_name)] = _content_hash(content)
         context.artifact_discovery.refresh()
+    except FileExistsError:
+        return (
+            f"Draft {file_name} was just created by someone else, so it was not overwritten. "
+            f"Write your version to a new draft name (for example {_alternative_name(file_name)})."
+        )
     except (OSError, ValueError) as error:
         return f"Draft write failed: {_redact(error)}"
     return f"Saved draft for Studio review: .seeknal/drafts/{file_name}"
+
+
+def _alternative_name(file_name: str) -> str:
+    stem, dot, suffix = file_name.rpartition(".")
+    return f"{stem}_{uuid.uuid4().hex[:6]}{dot}{suffix}"
 
 
 def _read_api_key(path_value: str) -> str:
@@ -479,7 +522,9 @@ async def _run_turn(
     safety = """
 You are operating inside Seeknal Studio's draft-only pilot.
 You may inspect pipeline definitions and create or update files only under
-.seeknal/drafts using draft_node and write_draft. Do not apply drafts, edit
+.seeknal/drafts using draft_node and write_draft. write_draft only overwrites
+drafts you created in this conversation; for any other existing draft, write a
+new draft name instead of replacing it. Do not apply drafts, edit
 active pipeline files, execute code or SQL, run pipelines, publish, browse the
 web, or claim validation/execution occurred. Finish by naming every draft path
 created and state that Studio review, validation, apply, and run are pending.
@@ -596,6 +641,8 @@ def main() -> int:
                     or not question.strip()
                 ):
                     raise ValueError("invalid agent turn")
+                global _ACTIVE_SESSION
+                _ACTIVE_SESSION = session_id
                 result = asyncio.run(_run_turn(
                     project, config, key, question.strip(), histories.setdefault(session_id, []), request_id,
                 ))

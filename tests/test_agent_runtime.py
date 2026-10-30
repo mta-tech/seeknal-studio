@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import os
 from pathlib import Path
 import queue
@@ -582,6 +583,58 @@ print(json.dumps(verify_effective_tools(project,config,'test-only-key')))
         rejected = write_draft("../../outside.yml", "secret")
         self.assertIn("Invalid draft filename", rejected)
         self.assertFalse((self.root / "outside.yml").exists())
+
+    def test_write_draft_never_overwrites_drafts_it_did_not_write(self):
+        _ensure_runtime_imports()
+        import agent_worker
+        from seeknal.ask.agents.tools._context import set_tool_context
+
+        set_tool_context(SimpleNamespace(
+            project_path=self.project,
+            fs_lock=threading.Lock(),
+            artifact_discovery=SimpleNamespace(refresh=lambda: None),
+        ))
+        agent_worker._AGENT_DRAFTS.clear()
+        self.addCleanup(agent_worker._AGENT_DRAFTS.clear)
+        drafts = _safe_drafts_root(self.project)
+        # A teammate's (or Studio's) draft is left alone; the agent is told to use a new name.
+        theirs = drafts / "draft_transform_orders_clean.yml"
+        theirs.write_text("kind: transform\nname: orders_clean\n# teammate\n")
+        result = write_draft("draft_transform_orders_clean.yml", "kind: transform\nname: orders_clean\n")
+        self.assertIn("was not overwritten", result)
+        self.assertIn("teammate", theirs.read_text())
+        suggested = re.search(r"\(for example (draft_\w+\.yml)\)", result).group(1)
+        self.assertIn("Saved draft", write_draft(suggested, "kind: transform\nname: orders_clean\n"))
+        # Its own draft can be revised...
+        mine = "draft_transform_orders_weekly.yml"
+        self.assertIn("Saved draft", write_draft(mine, "v1\n"))
+        self.assertIn("Saved draft", write_draft(mine, "v2\n"))
+        self.assertEqual("v2\n", (drafts / mine).read_text())
+        # ...until someone else edits it.
+        (drafts / mine).write_text("v2\n# reviewer tweak\n")
+        result = write_draft(mine, "v3\n")
+        self.assertIn("was changed since you wrote it", result)
+        self.assertIn("reviewer tweak", (drafts / mine).read_text())
+        # Ownership is per conversation: another conversation cannot revise it.
+        shared = "draft_transform_orders_daily.yml"
+        agent_worker._ACTIVE_SESSION = "conversation-a"
+        self.addCleanup(setattr, agent_worker, "_ACTIVE_SESSION", None)
+        self.assertIn("Saved draft", write_draft(shared, "a\n"))
+        agent_worker._ACTIVE_SESSION = "conversation-b"
+        self.assertIn("not created in this conversation", write_draft(shared, "b\n"))
+        self.assertEqual("a\n", (drafts / shared).read_text())
+        # A draft someone creates between the check and the write is not replaced.
+        racing = "draft_transform_orders_race.yml"
+        real_write = agent_worker._atomic_draft_write
+
+        def teammate_wins(directory, name, content, *, replace):
+            (directory / name).write_text("teammate\n")
+            return real_write(directory, name, content, replace=replace)
+
+        with mock.patch.object(agent_worker, "_atomic_draft_write", teammate_wins):
+            result = write_draft(racing, "mine\n")
+        self.assertIn("just created by someone else", result)
+        self.assertEqual("teammate\n", (drafts / racing).read_text())
 
     def test_write_draft_rejects_symlink_target_without_touching_destination(self):
         _ensure_runtime_imports()

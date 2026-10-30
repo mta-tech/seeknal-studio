@@ -32,6 +32,8 @@ ROOT = Path(__file__).resolve().parent
 TOKEN_HEADER = "X-Seeknal-Studio-Token"
 REMOTE_CACHE = "~/.cache/seeknal-studio"
 READY_MARKER = b"SEEKNAL_STUDIO_READY "
+BUSY_MARKER = b"SEEKNAL_STUDIO_BUSY "
+PROJECT_BUSY_EXIT = 5
 HEARTBEAT_SECONDS = 10
 RUNTIME_SETUP_SECONDS = 900
 # Files the remote backend needs. Static UI files are included so the remote
@@ -374,9 +376,24 @@ class RemoteSession:
         self._host.stdin.flush()
         # Heartbeats start now: the host's silence timer runs during startup too.
         threading.Thread(target=self._heartbeat, name="seeknal-ssh-heartbeat", daemon=True).start()
-        line = self._ready_line(self._host.stdout, 150)
+        holder: dict = {}
+
+        def busy(record: dict) -> None:
+            holder.update(record)
+            self._note(f"another Studio session has this project open ({_describe_holder(record)}); waiting for it to close")
+
+        line = self._ready_line(self._host.stdout, 150, busy)
         if not line:
-            code = self._host.poll()
+            try:
+                # stdout closes just before ssh exits; wait briefly for its code.
+                code = self._host.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                code = None
+            if code == PROJECT_BUSY_EXIT:
+                raise RuntimeError(
+                    f"Another Studio session already has this remote project open ({_describe_holder(holder)}). "
+                    "Close it there, or wait about a minute after it disconnects, then try again."
+                )
             raise RuntimeError(
                 "remote Studio backend did not start"
                 + (f" (exit {code})" if code is not None else " within 150 seconds")
@@ -391,7 +408,7 @@ class RemoteSession:
         self._note(f"backend listening on remote 127.0.0.1:{self.remote_port}; log {self.remote_log}")
 
     @staticmethod
-    def _ready_line(stream: IO[bytes], timeout: float) -> Optional[bytes]:
+    def _ready_line(stream: IO[bytes], timeout: float, on_busy=None) -> Optional[bytes]:
         # Shell startup files on the host may print before remote_host.py runs;
         # only a line carrying the readiness marker counts.
         found: list[bytes] = []
@@ -401,6 +418,12 @@ class RemoteSession:
                 if line.startswith(READY_MARKER):
                     found.append(line.strip())
                     return
+                if line.startswith(BUSY_MARKER) and on_busy is not None:
+                    try:
+                        record = json.loads(line[len(BUSY_MARKER):])
+                    except ValueError:
+                        record = {}
+                    on_busy(record if isinstance(record, dict) else {})
 
         reader = threading.Thread(target=scan, daemon=True)
         reader.start()
@@ -492,3 +515,10 @@ class RemoteSession:
             _terminate(host)
         if host.stdout:
             host.stdout.close()
+
+
+def _describe_holder(holder: dict) -> str:
+    client = holder.get("client") if isinstance(holder.get("client"), str) else None
+    started = holder.get("started_at") if isinstance(holder.get("started_at"), str) else None
+    parts = [f"opened from {client[:64]}" if client else None, f"since {started[:40]}" if started else None]
+    return ", ".join(part for part in parts if part) or "details unavailable"

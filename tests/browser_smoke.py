@@ -76,7 +76,8 @@ try:
     check('restored pipeline recovers', recovered['status'] == 'succeeded' and recovered['exit_code'] == 0, recovered)
     check('agent honestly disconnected', not browser('studio.snapshot()')['agentConfigured'], api('/api/agent/status'))
 finally:
-    if api('/api/file?path=' + path)['content'] != original:
-        api('/api/file', {'path': path, 'content': original})
+    current = api('/api/file?path=' + path)
+    if current['content'] != original:
+        api('/api/file', {'path': path, 'content': original, 'base_hash': current['content_hash']})
     (ROOT / 'evidence/browser-smoke.json').write_text(json.dumps(results, indent=2))
 print(json.dumps({'passed': len(results), 'failed': sum(not item['passed'] for item in results)}, indent=2))
