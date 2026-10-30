@@ -174,6 +174,44 @@ class BackendUnitTests(unittest.TestCase):
             draft.unlink(missing_ok=True)
             target.unlink(missing_ok=True)
 
+    def test_full_run_freshness_survives_restart_and_old_state_fails_safe(self):
+        server = self.server
+        previous = server.STUDIO_STATE.read_bytes() if server.STUDIO_STATE.exists() else None
+        run_state = self.project / "target" / "run_state.json"
+        previous_run_state = run_state.read_bytes() if run_state.exists() else None
+        original_seeknal, original_commands = server.SEEKNAL, server.COMMANDS
+        # A stand-in for `seeknal run --full` that rewrites the run state as Seeknal does.
+        fake_run = (
+            "import json, pathlib; p = pathlib.Path('target/run_state.json');"
+            "p.parent.mkdir(exist_ok=True); p.write_text(json.dumps({'run_id': 'studio-run'}))"
+        )
+        try:
+            server.SEEKNAL = Path(sys.executable)
+            server.COMMANDS = {**original_commands, "run": ["-c", fake_run]}
+            store = server.JobStore()
+            job = store.create("run", None)
+            deadline = time.time() + 30
+            while store.get(job["id"])["status"] in {"queued", "running"} and time.time() < deadline:
+                time.sleep(0.05)
+            self.assertEqual("succeeded", store.get(job["id"])["status"], store.get(job["id"]).get("logs"))
+            self.assertIn("studio-run", run_state.read_text())
+            # Fresh right after the run, and still fresh after a restart.
+            self.assertEqual(server.freshness_fingerprint(), store.last_successful_fingerprint)
+            self.assertEqual(server.freshness_fingerprint(), server.JobStore().last_successful_fingerprint)
+            # State saved by an older Studio (sources only) is treated as stale, never as fresh.
+            server.save_successful_fingerprint(server.project_fingerprint())
+            self.assertIsNone(server.JobStore().last_successful_fingerprint)
+        finally:
+            server.SEEKNAL, server.COMMANDS = original_seeknal, original_commands
+            if previous is None:
+                server.STUDIO_STATE.unlink(missing_ok=True)
+            else:
+                server.STUDIO_STATE.write_bytes(previous)
+            if previous_run_state is None:
+                run_state.unlink(missing_ok=True)
+            else:
+                run_state.write_bytes(previous_run_state)
+
     def test_cancelled_run_marker_does_not_resurrect_after_restart(self):
         previous = self.server.STUDIO_STATE.read_bytes() if self.server.STUDIO_STATE.exists() else None
         original_seeknal = self.server.SEEKNAL
