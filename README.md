@@ -259,3 +259,7 @@ open 'dist/Seeknal Studio.app'
 The rebuilt bundle includes Studio, Webframe, the demo, the owned-agent code, and a copy of the local managed-runtime configuration. It does not embed `.runtime/venv`; the copied configuration still points to the external managed 2.14.0 runtime on this development machine, so the bundle is not portable. Final native QA matched all 12 packaged sources and the runtime configuration to the frozen source, launched the managed 2.14.0 backend, exposed the native draft types, and proved that closing the launcher stopped the backend. See [evidence/seeknal-2.14/package-receipt.json](evidence/seeknal-2.14/package-receipt.json). The bundle does not include credentials or user agent configuration. Signing, notarization, a portable managed runtime, automatic updates, and Windows/Linux installers remain future release work.
 
 The editor is intentionally lightweight and does not yet provide an LSP or refactoring engine. The current deliverable is a local pilot, not a production deployment.
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
