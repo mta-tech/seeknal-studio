@@ -1,6 +1,7 @@
 # Plan: live editor diagnostics (LSP phase 1)
 
-Status: proposed, awaiting approval. Nothing here is implemented yet.
+Status: M1–M3 implemented (`f048a32`, `e0d3ede`). M4 not started. Where the build differs
+from this plan, see section 7.
 
 Goal: while editing a pipeline file, Studio underlines and lists
 1. syntax errors (node YAML, the SQL inside it, Python node files),
@@ -103,12 +104,12 @@ Response:
 
 ## 5. Milestones
 
-| Milestone | Scope | Done when |
-|---|---|---|
-| M1 Syntax | endpoint, YAML / node-shape / SQL / Python syntax, underlines, Problems list | a `SELEC` typo inside a `|` block is marked at the exact line and column; p95 < 300 ms on `demo/`; a `.py` node that writes a marker file on import never runs; `target/` is untouched |
-| M2 Tables | unknown `inputs` refs, unknown SQL tables, `ref()` not in inputs, suggestions | no false positives on CTEs, aliases, `input_N`, `__THIS__` (reusing the cases in `test_sql_draft_routes.py`) |
-| M3 Columns | schema index, SQL inference, last-run fallback | typos in qualified and unqualified columns flagged with suggestions; no flags on select aliases, `EXCLUDE`/`REPLACE`, struct access; stale last-run schemas only warn |
-| M4 Later | completion of tables/columns, hover types, go-to-definition, then a pygls adapter if a proper editor component is adopted | separate plan |
+| Milestone | Scope | Done when | Status |
+|---|---|---|---|
+| M1 Syntax | endpoint, YAML / node-shape / SQL / Python syntax, underlines, Problems list | a `SELEC` typo inside a `|` block is marked at the exact line and column; p95 < 300 ms on `demo/`; a `.py` node that writes a marker file on import never runs; `target/` is untouched | done, `f048a32` |
+| M2 Tables | unknown `inputs` refs, unknown SQL tables, `ref()` not in inputs, suggestions | no false positives on CTEs, aliases, `input_N`, `__THIS__` (reusing the cases in `test_sql_draft_routes.py`) | done, `f048a32` |
+| M3 Columns | schema index, SQL inference, last-run fallback | typos in qualified and unqualified columns flagged with suggestions; no flags on select aliases, `EXCLUDE`/`REPLACE`, struct access; stale last-run schemas only warn | done, `e0d3ede` |
+| M4 Later | completion of tables/columns, hover types, go-to-definition, then a pygls adapter if a proper editor component is adopted | separate plan | not started |
 
 Tests: `tests/test_diagnostics.py` runs `studio_lint` on temporary fixture projects
 (including must-not-flag cases); a route test; a gateway-forwarding test; Node checks of the
@@ -125,3 +126,33 @@ verified in the running app on the local and SSH workspaces.
 - Open: which table-name forms Seeknal officially supports (bare `kind_name`, `__THIS__`,
   upstream nodes not listed in `inputs`); whether diagnostics should ever block Dry run;
   whether skipping column checks for Python nodes without a cached graph is acceptable.
+
+## 7. As built (M1–M3)
+
+Changes from the plan above, all made during review:
+
+- Column sources are not "first available wins". Each source has its own severity:
+  - a column missing from the upstream node's declared `columns:` is a warning;
+  - a column missing from the schema inferred from upstream SQL is an error only when that
+    schema is complete;
+  - a column missing from the last-run Parquet schema is a warning, labelled "(from last run)".
+- The last-run schema is read by DuckDB's `parquet_schema()`, not a hand-written footer
+  parser, which could loop forever. The file is opened one path component at a time with
+  `O_NOFOLLOW` (`open_inside`), so a swapped parent symlink cannot redirect it. DuckDB runs
+  on a locked connection that can read only that file descriptor, with one thread and a
+  128 MB memory limit.
+- Ranges use UTF-16 code units (the LSP default), so tabs and non-BMP characters such as
+  emoji line up.
+- YAML alias expansion is capped at 100,000 values and recursive aliases are detected, so
+  an alias bomb is reported instead of hanging the linter.
+- `feature_group` nodes get syntax checks and a `ref()`-not-in-inputs error only.
+- Transform rules mirror the executor: `__THIS__` only with exactly one list input, and the
+  mapping form of `inputs`.
+- Indexing reads only `*.yml`, skips symlinks, and stops at 2,000 files or 20 MB.
+- A response carries at most 200 diagnostics.
+
+Not covered yet:
+
+- SQL outside transform nodes: source `params.query`, rule SQL, expressions.
+- Reading last-run Parquet on Linux is untested; if it fails, those columns count as unknown
+  rather than being flagged.
